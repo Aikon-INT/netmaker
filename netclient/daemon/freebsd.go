@@ -3,7 +3,6 @@ package daemon
 import (
 	"log"
 	"os"
-	"path/filepath"
 
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/netclient/ncutils"
@@ -11,11 +10,10 @@ import (
 
 // SetupFreebsdDaemon -- sets up daemon for freebsd
 func SetupFreebsdDaemon() error {
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	binarypath, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	binarypath := dir + "/netclient"
 
 	_, err = os.Stat("/etc/netclient/config")
 	if os.IsNotExist(err) {
@@ -25,13 +23,13 @@ func SetupFreebsdDaemon() error {
 		return err
 	}
 	//install binary
-	//should check if the existing binary is the corect version -- for now only copy if file doesn't exist
-	if !ncutils.FileExists(EXEC_DIR + "netclient") {
-		err = ncutils.Copy(binarypath, EXEC_DIR+"netclient")
-		if err != nil {
-			log.Println(err)
-			return err
-		}
+	if ncutils.FileExists(EXEC_DIR + "netclient") {
+		logger.Log(0, "updating netclient binary in ", EXEC_DIR)
+	}
+	err = ncutils.Copy(binarypath, EXEC_DIR+"netclient")
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 
 	rcFile := `#!/bin/sh

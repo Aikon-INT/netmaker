@@ -13,18 +13,15 @@ import (
 
 // setting dev by default
 func getEnv() string {
-
 	env := os.Getenv("NETMAKER_ENV")
-
 	if len(env) == 0 {
 		return "dev"
 	}
-
 	return env
 }
 
 // Config : application config stored as global variable
-var Config *EnvironmentConfig
+var Config *EnvironmentConfig = &EnvironmentConfig{}
 var SetupErr error
 
 // EnvironmentConfig - environment conf struct
@@ -39,10 +36,6 @@ type ServerConfig struct {
 	APIConnString         string `yaml:"apiconn"`
 	APIHost               string `yaml:"apihost"`
 	APIPort               string `yaml:"apiport"`
-	GRPCConnString        string `yaml:"grpcconn"`
-	GRPCHost              string `yaml:"grpchost"`
-	GRPCPort              string `yaml:"grpcport"`
-	GRPCSecure            string `yaml:"grpcsecure"`
 	MQHOST                string `yaml:"mqhost"`
 	MasterKey             string `yaml:"masterkey"`
 	DNSKey                string `yaml:"dnskey"`
@@ -54,7 +47,6 @@ type ServerConfig struct {
 	ClientMode            string `yaml:"clientmode"`
 	DNSMode               string `yaml:"dnsmode"`
 	DisableRemoteIPCheck  string `yaml:"disableremoteipcheck"`
-	GRPCSSL               string `yaml:"grpcssl"`
 	Version               string `yaml:"version"`
 	SQLConn               string `yaml:"sqlconn"`
 	Platform              string `yaml:"platform"`
@@ -69,14 +61,13 @@ type ServerConfig struct {
 	DisplayKeys           string `yaml:"displaykeys"`
 	AzureTenant           string `yaml:"azuretenant"`
 	RCE                   string `yaml:"rce"`
-	Debug                 bool   `yaml:"debug"`
 	Telemetry             string `yaml:"telemetry"`
 	ManageIPTables        string `yaml:"manageiptables"`
 	PortForwardServices   string `yaml:"portforwardservices"`
 	HostNetwork           string `yaml:"hostnetwork"`
-	CommsCIDR             string `yaml:"commscidr"`
 	MQPort                string `yaml:"mqport"`
-	CommsID               string `yaml:"commsid"`
+	MQServerPort          string `yaml:"mqserverport"`
+	Server                string `yaml:"server"`
 }
 
 // SQLConfig - Generic SQL Config
@@ -90,9 +81,11 @@ type SQLConfig struct {
 }
 
 // reading in the env file
-func readConfig() (*EnvironmentConfig, error) {
-	file := fmt.Sprintf("environments/%s.yaml", getEnv())
-	f, err := os.Open(file)
+func ReadConfig(absolutePath string) (*EnvironmentConfig, error) {
+	if len(absolutePath) == 0 {
+		absolutePath = fmt.Sprintf("environments/%s.yaml", getEnv())
+	}
+	f, err := os.Open(absolutePath)
 	var cfg EnvironmentConfig
 	if err != nil {
 		return &cfg, err
@@ -104,11 +97,4 @@ func readConfig() (*EnvironmentConfig, error) {
 		return &cfg, err
 	}
 	return &cfg, err
-
-}
-
-func init() {
-	if Config, SetupErr = readConfig(); SetupErr != nil {
-		Config = &EnvironmentConfig{}
-	}
 }

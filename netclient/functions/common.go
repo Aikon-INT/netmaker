@@ -1,27 +1,29 @@
 package functions
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 
-	nodepb "github.com/gravitl/netmaker/grpc"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/netclient/auth"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/daemon"
 	"github.com/gravitl/netmaker/netclient/local"
 	"github.com/gravitl/netmaker/netclient/ncutils"
 	"github.com/gravitl/netmaker/netclient/wireguard"
 	"golang.zx2c4.com/wireguard/wgctrl"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
+
+// LINUX_APP_DATA_PATH - linux path
+const LINUX_APP_DATA_PATH = "/etc/netmaker"
 
 // ListPorts - lists ports of WireGuard devices
 func ListPorts() error {
@@ -125,12 +127,13 @@ func Uninstall() error {
 		logger.Log(1, "continuing uninstall without leaving networks")
 	} else {
 		for _, network := range networks {
-			err = LeaveNetwork(network, true)
+			err = LeaveNetwork(network)
 			if err != nil {
 				logger.Log(1, "Encounter issue leaving network ", network, ": ", err.Error())
 			}
 		}
 	}
+	err = nil
 	// clean up OS specific stuff
 	if ncutils.IsWindows() {
 		daemon.CleanupWindows()
@@ -148,57 +151,39 @@ func Uninstall() error {
 }
 
 // LeaveNetwork - client exits a network
-func LeaveNetwork(network string, force bool) error {
+func LeaveNetwork(network string) error {
 	cfg, err := config.ReadConfig(network)
 	if err != nil {
 		return err
 	}
-	servercfg := cfg.Server
 	node := cfg.Node
-	if node.NetworkSettings.IsComms == "yes" && !force {
-		return errors.New("COMMS_NET - You are trying to leave the comms network. This will break network updates. Unless you re-join. If you really want to leave, run with --force=yes.")
-	}
-
 	if node.IsServer != "yes" {
-		var wcclient nodepb.NodeServiceClient
-		conn, err := grpc.Dial(cfg.Server.GRPCAddress,
-			ncutils.GRPCRequestOpts(cfg.Server.GRPCSSL))
+		token, err := Authenticate(cfg)
 		if err != nil {
-			log.Printf("Unable to establish client connection to "+servercfg.GRPCAddress+": %v", err)
-		}
-		defer conn.Close()
-		wcclient = nodepb.NewNodeServiceClient(conn)
-
-		ctx, err := auth.SetJWT(wcclient, network)
-		if err != nil {
-			log.Printf("Failed to authenticate: %v", err)
-		} else { // handle client side
-			var header metadata.MD
-			nodeData, err := json.Marshal(&node)
-			if err == nil {
-				_, err = wcclient.DeleteNode(
-					ctx,
-					&nodepb.Object{
-						Data: string(nodeData),
-						Type: nodepb.NODE_TYPE,
-					},
-					grpc.Header(&header),
-				)
-				if err != nil {
-					logger.Log(1, "encountered error deleting node: ", err.Error())
+			logger.Log(0, "unable to authenticate: "+err.Error())
+		} else {
+			url := "https://" + cfg.Server.API + "/api/nodes/" + cfg.Network + "/" + cfg.Node.ID
+			response, err := API("", http.MethodDelete, url, token)
+			if err != nil {
+				logger.Log(0, "error deleting node on server: "+err.Error())
+			} else {
+				if response.StatusCode == http.StatusOK {
+					logger.Log(0, "deleted node", cfg.Node.Name, " on network ", cfg.Network)
 				} else {
-					logger.Log(1, "removed machine from ", node.Network, " network on remote server")
+					bodybytes, _ := io.ReadAll(response.Body)
+					defer response.Body.Close()
+					logger.Log(0, fmt.Sprintf("error deleting node on server %s %s", response.Status, string(bodybytes)))
 				}
 			}
 		}
 	}
-
 	wgClient, wgErr := wgctrl.New()
 	if wgErr == nil {
 		removeIface := cfg.Node.Interface
+		queryAddr := cfg.Node.PrimaryAddress()
 		if ncutils.IsMac() {
 			var macIface string
-			macIface, wgErr = local.GetMacIface(cfg.Node.Address)
+			macIface, wgErr = local.GetMacIface(queryAddr)
 			if wgErr == nil && removeIface != "" {
 				removeIface = macIface
 			}
@@ -206,10 +191,10 @@ func LeaveNetwork(network string, force bool) error {
 		}
 		dev, devErr := wgClient.Device(removeIface)
 		if devErr == nil {
-			local.FlushPeerRoutes(removeIface, cfg.Node.Address, dev.Peers[:])
+			local.FlushPeerRoutes(removeIface, queryAddr, dev.Peers[:])
 			_, cidr, cidrErr := net.ParseCIDR(cfg.NetworkSettings.AddressRange)
 			if cidrErr == nil {
-				local.RemoveCIDRRoute(removeIface, cfg.Node.Address, cidr)
+				local.RemoveCIDRRoute(removeIface, queryAddr, cidr)
 			}
 		} else {
 			logger.Log(1, "could not flush peer routes when leaving network, ", cfg.Node.Network)
@@ -319,5 +304,108 @@ func WipeLocal(network string) error {
 			log.Println(err.Error())
 		}
 	}
+	err = removeHostDNS(ifacename, ncutils.IsWindows())
+	if err != nil {
+		logger.Log(0, "failed to delete dns entries for", ifacename, err.Error())
+	}
 	return err
+}
+
+// GetNetmakerPath - gets netmaker path locally
+func GetNetmakerPath() string {
+	return LINUX_APP_DATA_PATH
+}
+
+//API function to interact with netmaker api endpoints. response from endpoint is returned
+func API(data any, method, url, authorization string) (*http.Response, error) {
+	var request *http.Request
+	var err error
+	if data != "" {
+		payload, err := json.Marshal(data)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding data %w", err)
+		}
+		request, err = http.NewRequest(method, url, bytes.NewBuffer(payload))
+		if err != nil {
+			return nil, fmt.Errorf("error creating http request %w", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+	} else {
+		request, err = http.NewRequest(method, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("error creating http request %w", err)
+		}
+	}
+	if authorization != "" {
+		request.Header.Set("authorization", "Bearer "+authorization)
+	}
+	client := http.Client{}
+	return client.Do(request)
+}
+
+// Authenticate authenticates with api to permit subsequent interactions with the api
+func Authenticate(cfg *config.ClientConfig) (string, error) {
+
+	pass, err := os.ReadFile(ncutils.GetNetclientPathSpecific() + "secret-" + cfg.Network)
+	if err != nil {
+		return "", fmt.Errorf("could not read secrets file %w", err)
+	}
+	data := models.AuthParams{
+		MacAddress: cfg.Node.MacAddress,
+		ID:         cfg.Node.ID,
+		Password:   string(pass),
+	}
+	url := "https://" + cfg.Server.API + "/api/nodes/adm/" + cfg.Network + "/authenticate"
+	response, err := API(data, http.MethodPost, url, "")
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		bodybytes, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("failed to authenticate %s %s", response.Status, string(bodybytes))
+	}
+	resp := models.SuccessResponse{}
+	if err := json.NewDecoder(response.Body).Decode(&resp); err != nil {
+		return "", fmt.Errorf("error decoding respone %w", err)
+	}
+	tokenData := resp.Response.(map[string]interface{})
+	token := tokenData["AuthToken"]
+	return token.(string), nil
+}
+
+// RegisterWithServer calls the register endpoint with privatekey and commonname - api returns ca and client certificate
+func SetServerInfo(cfg *config.ClientConfig) error {
+	cfg, err := config.ReadConfig(cfg.Network)
+	if err != nil {
+		return err
+	}
+	url := "https://" + cfg.Server.API + "/api/server/getserverinfo"
+	logger.Log(1, "server at "+url)
+
+	token, err := Authenticate(cfg)
+	if err != nil {
+		return err
+	}
+	response, err := API("", http.MethodGet, url, token)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return errors.New(response.Status)
+	}
+	var resp models.ServerConfig
+	if err := json.NewDecoder(response.Body).Decode(&resp); err != nil {
+		return errors.New("unmarshal cert error " + err.Error())
+	}
+
+	// set broker information on register
+	cfg.Server.Server = resp.Server
+	cfg.Server.MQPort = resp.MQPort
+
+	if err = config.ModServerConfig(&cfg.Server, cfg.Node.Network); err != nil {
+		logger.Log(0, "error overwriting config with broker information: "+err.Error())
+	}
+
+	return nil
 }

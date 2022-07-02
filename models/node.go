@@ -17,7 +17,7 @@ const (
 	TEN_YEARS_IN_SECONDS = 300000000
 	// MAX_NAME_LENGTH - max name length of node
 	MAX_NAME_LENGTH = 62
-	// == ACTIONS == (can only be set by GRPC)
+	// == ACTIONS == (can only be set by server)
 	// NODE_UPDATE_KEY - action to update key
 	NODE_UPDATE_KEY = "updatekey"
 	// NODE_DELETE - delete node action
@@ -26,6 +26,8 @@ const (
 	NODE_IS_PENDING = "pending"
 	// NODE_NOOP - node no op action
 	NODE_NOOP = "noop"
+	// NODE_FORCE_UPDATE - indicates a node should pull all changes
+	NODE_FORCE_UPDATE = "force"
 )
 
 var seededRand *rand.Rand = rand.New(
@@ -33,13 +35,14 @@ var seededRand *rand.Rand = rand.New(
 
 // Node - struct for node model
 type Node struct {
-	ID                  string   `json:"id,omitempty" bson:"id,omitempty" yaml:"id,omitempty" validate:"required,min=5"`
+	ID                  string   `json:"id,omitempty" bson:"id,omitempty" yaml:"id,omitempty" validate:"required,min=5" validate:"id_unique`
 	Address             string   `json:"address" bson:"address" yaml:"address" validate:"omitempty,ipv4"`
 	Address6            string   `json:"address6" bson:"address6" yaml:"address6" validate:"omitempty,ipv6"`
 	LocalAddress        string   `json:"localaddress" bson:"localaddress" yaml:"localaddress" validate:"omitempty,ip"`
 	Name                string   `json:"name" bson:"name" yaml:"name" validate:"omitempty,max=62,in_charset"`
 	NetworkSettings     Network  `json:"networksettings" bson:"networksettings" yaml:"networksettings" validate:"-"`
 	ListenPort          int32    `json:"listenport" bson:"listenport" yaml:"listenport" validate:"omitempty,numeric,min=1024,max=65535"`
+	LocalListenPort     int32    `json:"locallistenport" bson:"locallistenport" yaml:"locallistenport" validate:"numeric,min=0,max=65535"`
 	PublicKey           string   `json:"publickey" bson:"publickey" yaml:"publickey" validate:"required,base64"`
 	Endpoint            string   `json:"endpoint" bson:"endpoint" yaml:"endpoint" validate:"required,ip"`
 	PostUp              string   `json:"postup" bson:"postup" yaml:"postup"`
@@ -53,7 +56,7 @@ type Node struct {
 	ExpirationDateTime  int64    `json:"expdatetime" bson:"expdatetime" yaml:"expdatetime"`
 	LastPeerUpdate      int64    `json:"lastpeerupdate" bson:"lastpeerupdate" yaml:"lastpeerupdate"`
 	LastCheckIn         int64    `json:"lastcheckin" bson:"lastcheckin" yaml:"lastcheckin"`
-	MacAddress          string   `json:"macaddress" bson:"macaddress" yaml:"macaddress" validate:"macaddress_unique"`
+	MacAddress          string   `json:"macaddress" bson:"macaddress" yaml:"macaddress"`
 	Password            string   `json:"password" bson:"password" yaml:"password" validate:"required,min=6"`
 	Network             string   `json:"network" bson:"network" yaml:"network" validate:"network_exists"`
 	IsRelayed           string   `json:"isrelayed" bson:"isrelayed" yaml:"isrelayed"`
@@ -66,11 +69,10 @@ type Node struct {
 	EgressGatewayRanges []string `json:"egressgatewayranges" bson:"egressgatewayranges" yaml:"egressgatewayranges"`
 	RelayAddrs          []string `json:"relayaddrs" bson:"relayaddrs" yaml:"relayaddrs"`
 	IngressGatewayRange string   `json:"ingressgatewayrange" bson:"ingressgatewayrange" yaml:"ingressgatewayrange"`
-	IsStatic            string   `json:"isstatic" bson:"isstatic" yaml:"isstatic" validate:"checkyesorno"`
-	UDPHolePunch        string   `json:"udpholepunch" bson:"udpholepunch" yaml:"udpholepunch" validate:"checkyesorno"`
-	//PullChanges         string      `json:"pullchanges" bson:"pullchanges" yaml:"pullchanges" validate:"checkyesorno"`
+	// IsStatic - refers to if the Endpoint is set manually or dynamically
+	IsStatic     string      `json:"isstatic" bson:"isstatic" yaml:"isstatic" validate:"checkyesorno"`
+	UDPHolePunch string      `json:"udpholepunch" bson:"udpholepunch" yaml:"udpholepunch" validate:"checkyesorno"`
 	DNSOn        string      `json:"dnson" bson:"dnson" yaml:"dnson" validate:"checkyesorno"`
-	IsDualStack  string      `json:"isdualstack" bson:"isdualstack" yaml:"isdualstack" validate:"checkyesorno"`
 	IsServer     string      `json:"isserver" bson:"isserver" yaml:"isserver" validate:"checkyesorno"`
 	Action       string      `json:"action" bson:"action" yaml:"action"`
 	IsLocal      string      `json:"islocal" bson:"islocal" yaml:"islocal" validate:"checkyesorno"`
@@ -79,7 +81,7 @@ type Node struct {
 	OS           string      `json:"os" bson:"os" yaml:"os"`
 	MTU          int32       `json:"mtu" bson:"mtu" yaml:"mtu"`
 	Version      string      `json:"version" bson:"version" yaml:"version"`
-	CommID       string      `json:"commid" bson:"commid" yaml:"comid"`
+	Server       string      `json:"server" bson:"server" yaml:"server"`
 	TrafficKeys  TrafficKeys `json:"traffickeys" bson:"traffickeys" yaml:"traffickeys"`
 }
 
@@ -99,6 +101,14 @@ func isLess(ipA string, ipB string) bool {
 	ipNetA := net.ParseIP(ipA)
 	ipNetB := net.ParseIP(ipB)
 	return bytes.Compare(ipNetA, ipNetB) < 0
+}
+
+// Node.PrimaryAddress - return ipv4 address if present, else return ipv6
+func (node *Node) PrimaryAddress() string {
+	if node.Address != "" {
+		return node.Address
+	}
+	return node.Address6
 }
 
 // Node.SetDefaultMTU - sets default MTU of a node
@@ -199,13 +209,6 @@ func (node *Node) SetDNSOnDefault() {
 	}
 }
 
-// Node.SetIsDualStackDefault - set is dual stack default status
-func (node *Node) SetIsDualStackDefault() {
-	if node.IsDualStack == "" {
-		node.IsDualStack = "no"
-	}
-}
-
 // Node.SetIsServerDefault - sets node isserver default
 func (node *Node) SetIsServerDefault() {
 	if node.IsServer != "yes" {
@@ -253,10 +256,10 @@ func (node *Node) SetDefaultName() {
 func (newNode *Node) Fill(currentNode *Node) {
 	newNode.ID = currentNode.ID
 
-	if newNode.Address == "" && newNode.IsStatic != "yes" {
+	if newNode.Address == "" {
 		newNode.Address = currentNode.Address
 	}
-	if newNode.Address6 == "" && newNode.IsStatic != "yes" {
+	if newNode.Address6 == "" {
 		newNode.Address6 = currentNode.Address6
 	}
 	if newNode.LocalAddress == "" {
@@ -265,13 +268,16 @@ func (newNode *Node) Fill(currentNode *Node) {
 	if newNode.Name == "" {
 		newNode.Name = currentNode.Name
 	}
-	if newNode.ListenPort == 0 && newNode.IsStatic != "yes" {
+	if newNode.ListenPort == 0 {
 		newNode.ListenPort = currentNode.ListenPort
 	}
-	if newNode.PublicKey == "" && newNode.IsStatic != "yes" {
+	if newNode.LocalListenPort == 0 {
+		newNode.LocalListenPort = currentNode.LocalListenPort
+	}
+	if newNode.PublicKey == "" {
 		newNode.PublicKey = currentNode.PublicKey
 	}
-	if newNode.Endpoint == "" && newNode.IsStatic != "yes" {
+	if newNode.Endpoint == "" {
 		newNode.Endpoint = currentNode.Endpoint
 	}
 	if newNode.PostUp == "" {
@@ -345,18 +351,12 @@ func (newNode *Node) Fill(currentNode *Node) {
 	if newNode.DNSOn == "" {
 		newNode.DNSOn = currentNode.DNSOn
 	}
-	if newNode.IsDualStack == "" {
-		newNode.IsDualStack = currentNode.IsDualStack
-	}
 	if newNode.IsLocal == "" {
 		newNode.IsLocal = currentNode.IsLocal
 	}
 	if newNode.IPForwarding == "" {
 		newNode.IPForwarding = currentNode.IPForwarding
 	}
-	//if newNode.Roaming == "" {
-	//newNode.Roaming = currentNode.Roaming
-	//}
 	if newNode.Action == "" {
 		newNode.Action = currentNode.Action
 	}
@@ -393,6 +393,10 @@ func (newNode *Node) Fill(currentNode *Node) {
 	if newNode.IsHub == "" {
 		newNode.IsHub = currentNode.IsHub
 	}
+	if newNode.Server == "" {
+		newNode.Server = currentNode.Server
+	}
+	newNode.TrafficKeys = currentNode.TrafficKeys
 }
 
 // StringWithCharset - returns random string inside defined charset

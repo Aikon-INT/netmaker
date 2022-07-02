@@ -3,7 +3,6 @@ package daemon
 import (
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/gravitl/netmaker/logger"
@@ -16,18 +15,18 @@ const MAC_EXEC_DIR = "/usr/local/bin/"
 // SetupMacDaemon - Creates a daemon service from the netclient under LaunchAgents for MacOS
 func SetupMacDaemon() error {
 
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	binarypath, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	binarypath := dir + "/netclient"
 
-	if !ncutils.FileExists(MAC_EXEC_DIR + "netclient") {
-		err = ncutils.Copy(binarypath, MAC_EXEC_DIR+"netclient")
-		if err != nil {
-			log.Println(err)
-			return err
-		}
+	if ncutils.FileExists(MAC_EXEC_DIR + "netclient") {
+		logger.Log(0, "updating netclient binary in", MAC_EXEC_DIR)
+	}
+	err = ncutils.Copy(binarypath, MAC_EXEC_DIR+"netclient")
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 
 	_, errN := os.Stat("~/Library/LaunchAgents")
@@ -98,8 +97,8 @@ func MacDaemonString() string {
 			<string>/usr/local/bin/netclient</string>
 			<string>daemon</string>
 		</array>
-	<key>StandardOutPath</key><string>/etc/netclient/com.gravitl.netclient.log</string>
-	<key>StandardErrorPath</key><string>/etc/netclient/com.gravitl.netclient.log</string>
+	<key>StandardOutPath</key><string>/var/log/com.gravitl.netclient.log</string>
+	<key>StandardErrorPath</key><string>/var/log/com.gravitl.netclient.log</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>

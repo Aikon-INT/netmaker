@@ -1,10 +1,13 @@
 package logger
 
 import (
-	"os"
-	"strconv"
 	"strings"
+
+	"github.com/gravitl/netmaker/servercfg"
 )
+
+// Verbosity - current logging verbosity level (optionally set)
+var Verbosity = 0
 
 // MakeString - makes a string using golang string builder
 func MakeString(delimeter string, message ...string) string {
@@ -19,12 +22,9 @@ func MakeString(delimeter string, message ...string) string {
 }
 
 func getVerbose() int32 {
-	level, err := strconv.Atoi(os.Getenv("VERBOSITY"))
-	if err != nil || level < 0 {
-		level = 0
+	if Verbosity >= 1 && Verbosity <= 3 {
+		return int32(Verbosity)
 	}
-	if level > 3 {
-		level = 3
-	}
-	return int32(level)
+	Verbosity = int(servercfg.GetVerbosity())
+	return int32(Verbosity)
 }

@@ -1,41 +1,52 @@
 
 <p align="center">
-  <a href="https://netmaker.org">
-  <img src="./img/netmaker.png" width="75%"><break/>
+  <a href="https://netmaker.io">
+  <img src="./img/netmaker-teal.png" width="50%"><break/>
   </a>
 </p>
+
 <p align="center">
-a platform for modern, blazing fast virtual networks 
+<a href="https://runacap.com/ross-index/q1-2022/" target="_blank" rel="noopener">
+    <img src="https://runacap.com/wp-content/uploads/2022/06/ROSS_badge_white_Q1_2022.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q1 2022 | Runa Capital"  width="15%"/>
+</a>  
+<a href="https://www.ycombinator.com/companies/netmaker/" target="_blank" rel="noopener">
+    <img src="./img/y-combinator.png" alt="Y-Combinator" width="16%" />
+</a>  
+
 </p>
 
 <p align="center">
   <a href="https://github.com/gravitl/netmaker/releases">
-    <img src="https://img.shields.io/badge/Version-0.12.1-informational?style=flat-square" />
+    <img src="https://img.shields.io/badge/Version-0.14.4-informational?style=flat-square" />
   </a>
   <a href="https://hub.docker.com/r/gravitl/netmaker/tags">
-    <img src="https://img.shields.io/docker/pulls/gravitl/netmaker" />
+    <img src="https://img.shields.io/docker/pulls/gravitl/netmaker?label=downloads" />
   </a>  
   <a href="https://goreportcard.com/report/github.com/gravitl/netmaker">
     <img src="https://goreportcard.com/badge/github.com/gravitl/netmaker" />
   </a>
-  <a href="https://github.com/gravitl/netmaker/graphs/contributors">
-    <img src="https://img.shields.io/github/commit-activity/m/gravitl/netmaker?color=blue" />
-  </a>
-  <a href="https://twitter.com/intent/follow?screen_name=gravitlcorp">
-    <img src="https://img.shields.io/twitter/follow/gravitlcorp?style=social" />
+  <a href="https://twitter.com/intent/follow?screen_name=netmaker_io">
+    <img src="https://img.shields.io/twitter/follow/netmaker_io?label=follow&style=social" />
   </a>
   <a href="https://www.youtube.com/channel/UCach3lJY_xBV7rGrbUSvkZQ">
     <img src="https://img.shields.io/youtube/channel/views/UCach3lJY_xBV7rGrbUSvkZQ?style=social" />
   </a>
+  <a href="https://reddit.com/r/netmaker">
+    <img src="https://img.shields.io/reddit/subreddit-subscribers/netmaker?label=%2Fr%2Fnetmaker&style=social" />
+  </a>  
+  <a href="https://discord.gg/zRb9Vfhk8A">
+    <img src="https://img.shields.io/discord/825071750290210916?color=%09%237289da&label=chat" />
+  </a> 
 </p>
 
-# WireGuard® Automation from Homelab to Enterprise
-- [x] Peer-to-Peer Mesh Networks
-- [x] Kubernetes and Multi-Cloud Enablement
-- [x] Remote Site Access via Gateway
-- [x] OAuth and Private DNS Features
-- [x] Fine-grained access controls 
-- [x] Support for Linux, Mac, Windows, FreeBSD, iPhone, and Android
+# WireGuard<sup>®</sup> automation from homelab to enterprise
+
+| Create & Automate                         | Manage                                  |
+|-------------------------------------------|-----------------------------------------|
+| :heavy_check_mark: WireGuard Networks     | :heavy_check_mark: Admin UI             |
+| :heavy_check_mark: Remote Access Gateways | :heavy_check_mark: OAuth                |
+| :heavy_check_mark: Mesh VPNs              | :heavy_check_mark: Private DNS          |
+| :heavy_check_mark: Site-to-Site           | :heavy_check_mark: Access Control Lists |
 
 # Get Started in 5 Minutes  
 
@@ -43,12 +54,14 @@ a platform for modern, blazing fast virtual networks
 **For production-grade installations, visit the [Install Docs](https://netmaker.readthedocs.io/en/master/install.html).**  
 **For an HA install using helm on k8s, visit the [Helm Repo](https://github.com/gravitl/netmaker-helm/).**
 1. Get a cloud VM with Ubuntu 20.04 and a public IP.
-2. Open ports 443, 80, 53, and 51821-51830/udp on the VM firewall and in cloud security settings.
+2. Open ports 443, 53, and 51821-51830/udp on the VM firewall and in cloud security settings.
 3. Run the script **(see below for optional configurations)**:
 
 `wget -qO - https://raw.githubusercontent.com/gravitl/netmaker/master/scripts/nm-quick.sh | sudo bash`
 
-<img src="./img/visit-website.gif" width="50%" /><img src="./img/graph-readme.gif" width="50%" />
+<p float="left" align="middle">
+<img src="./img/readme.gif" />
+</p>
 
 Upon completion, the logs will display the instructions to connect various devices. These can also be retrieved from the UI under "Access Keys."
 
@@ -88,6 +101,9 @@ After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting
 
 - [Community (Discord)](https://discord.gg/zRb9Vfhk8A)
 
+- [Community (Reddit)](https://reddit.com/r/netmaker)
+
+
 - [Business (Subscription)](https://gravitl.com/plans/business)
 
 - [Learning Resources](https://gravitl.com/resources)
@@ -106,6 +122,9 @@ After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting
 
 - [Terraform Provider](https://github.com/madacluster/netmaker-terraform-provider)
 
+- [VyOS Integration](https://github.com/kylechase/vyos-netmaker)
+
+- [Netmaker K3S](https://github.com/geragcp/netmaker-k3s)
 
 ## Disclaimer
  [WireGuard](https://wireguard.com/) is a registered trademark of Jason A. Donenfeld.

@@ -3,19 +3,28 @@ package functions
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/cloverstd/tcping/ping"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/netclient/auth"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/ncutils"
+	"github.com/gravitl/netmaker/tls"
 )
+
+// pubNetworks hold the currently publishable networks
+var pubNetworks []string
 
 // Checkin  -- go routine that checks for public or local ip changes, publishes changes
 //   if there are no updates, simply "pings" the server as a checkin
-func Checkin(ctx context.Context, wg *sync.WaitGroup, currentComms map[string]bool) {
+func Checkin(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
@@ -24,72 +33,57 @@ func Checkin(ctx context.Context, wg *sync.WaitGroup, currentComms map[string]bo
 			return
 			//delay should be configuraable -> use cfg.Node.NetworkSettings.DefaultCheckInInterval ??
 		case <-time.After(time.Second * 60):
-			// logger.Log(0, "Checkin running")
-			//read latest config
-			networks, err := ncutils.GetSystemNetworks()
-			if err != nil {
-				return
-			}
-			for commsNet := range currentComms {
-				var currCommsCfg config.ClientConfig
-				currCommsCfg.Network = commsNet
-				currCommsCfg.ReadConfig()
-				for _, network := range networks {
-					var nodeCfg config.ClientConfig
-					nodeCfg.Network = network
-					nodeCfg.ReadConfig()
-					if nodeCfg.Node.CommID != commsNet {
-						continue // skip if not on current comms network
+			for _, network := range pubNetworks {
+				var nodeCfg config.ClientConfig
+				nodeCfg.Network = network
+				nodeCfg.ReadConfig()
+				if nodeCfg.Node.IsStatic != "yes" {
+					extIP, err := ncutils.GetPublicIP()
+					if err != nil {
+						logger.Log(1, "error encountered checking public ip addresses: ", err.Error())
 					}
-					if nodeCfg.Node.IsStatic != "yes" {
-						extIP, err := ncutils.GetPublicIP()
-						if err != nil {
-							logger.Log(1, "error encountered checking public ip addresses: ", err.Error())
-						}
-						if nodeCfg.Node.Endpoint != extIP && extIP != "" {
-							logger.Log(1, "endpoint has changed from ", nodeCfg.Node.Endpoint, " to ", extIP)
-							nodeCfg.Node.Endpoint = extIP
-							if err := PublishNodeUpdate(&currCommsCfg, &nodeCfg); err != nil {
-								logger.Log(0, "could not publish endpoint change")
-							}
-						}
-						intIP, err := getPrivateAddr()
-						if err != nil {
-							logger.Log(1, "error encountered checking private ip addresses: ", err.Error())
-						}
-						if nodeCfg.Node.LocalAddress != intIP && intIP != "" {
-							logger.Log(1, "local Address has changed from ", nodeCfg.Node.LocalAddress, " to ", intIP)
-							nodeCfg.Node.LocalAddress = intIP
-							if err := PublishNodeUpdate(&currCommsCfg, &nodeCfg); err != nil {
-								logger.Log(0, "could not publish local address change")
-							}
-						}
-					} else if nodeCfg.Node.IsLocal == "yes" && nodeCfg.Node.LocalRange != "" {
-						localIP, err := ncutils.GetLocalIP(nodeCfg.Node.LocalRange)
-						if err != nil {
-							logger.Log(1, "error encountered checking local ip addresses: ", err.Error())
-						}
-						if nodeCfg.Node.Endpoint != localIP && localIP != "" {
-							logger.Log(1, "endpoint has changed from "+nodeCfg.Node.Endpoint+" to ", localIP)
-							nodeCfg.Node.Endpoint = localIP
-							if err := PublishNodeUpdate(&currCommsCfg, &nodeCfg); err != nil {
-								logger.Log(0, "could not publish localip change")
-							}
+					if nodeCfg.Node.Endpoint != extIP && extIP != "" {
+						logger.Log(1, "endpoint has changed from ", nodeCfg.Node.Endpoint, " to ", extIP)
+						nodeCfg.Node.Endpoint = extIP
+						if err := PublishNodeUpdate(&nodeCfg); err != nil {
+							logger.Log(0, "could not publish endpoint change")
 						}
 					}
-					if err := PingServer(&currCommsCfg); err != nil {
-						logger.Log(0, "could not ping server on comms net, ", currCommsCfg.Network, "\n", err.Error())
-					} else {
-						Hello(&currCommsCfg, &nodeCfg)
+					intIP, err := getPrivateAddr()
+					if err != nil {
+						logger.Log(1, "error encountered checking private ip addresses: ", err.Error())
+					}
+					if nodeCfg.Node.LocalAddress != intIP && intIP != "" {
+						logger.Log(1, "local Address has changed from ", nodeCfg.Node.LocalAddress, " to ", intIP)
+						nodeCfg.Node.LocalAddress = intIP
+						if err := PublishNodeUpdate(&nodeCfg); err != nil {
+							logger.Log(0, "could not publish local address change")
+						}
+					}
+					_ = UpdateLocalListenPort(&nodeCfg)
+
+				} else if nodeCfg.Node.IsLocal == "yes" && nodeCfg.Node.LocalRange != "" {
+					localIP, err := ncutils.GetLocalIP(nodeCfg.Node.LocalRange)
+					if err != nil {
+						logger.Log(1, "error encountered checking local ip addresses: ", err.Error())
+					}
+					if nodeCfg.Node.Endpoint != localIP && localIP != "" {
+						logger.Log(1, "endpoint has changed from "+nodeCfg.Node.Endpoint+" to ", localIP)
+						nodeCfg.Node.Endpoint = localIP
+						if err := PublishNodeUpdate(&nodeCfg); err != nil {
+							logger.Log(0, "could not publish localip change")
+						}
 					}
 				}
+				Hello(&nodeCfg)
+				checkCertExpiry(&nodeCfg)
 			}
 		}
 	}
 }
 
 // PublishNodeUpdates -- saves node and pushes changes to broker
-func PublishNodeUpdate(commsCfg, nodeCfg *config.ClientConfig) error {
+func PublishNodeUpdate(nodeCfg *config.ClientConfig) error {
 	if err := config.Write(nodeCfg, nodeCfg.Network); err != nil {
 		return err
 	}
@@ -97,48 +91,109 @@ func PublishNodeUpdate(commsCfg, nodeCfg *config.ClientConfig) error {
 	if err != nil {
 		return err
 	}
-	if err = publish(commsCfg, nodeCfg, fmt.Sprintf("update/%s", nodeCfg.Node.ID), data, 1); err != nil {
+	if err = publish(nodeCfg, fmt.Sprintf("update/%s", nodeCfg.Node.ID), data, 1); err != nil {
 		return err
 	}
+
 	logger.Log(0, "sent a node update to server for node", nodeCfg.Node.Name, ", ", nodeCfg.Node.ID)
 	return nil
 }
 
 // Hello -- ping the broker to let server know node it's alive and well
-func Hello(commsCfg, nodeCfg *config.ClientConfig) {
-	if err := publish(commsCfg, nodeCfg, fmt.Sprintf("ping/%s", nodeCfg.Node.ID), []byte(ncutils.Version), 0); err != nil {
+func Hello(nodeCfg *config.ClientConfig) {
+	if err := publish(nodeCfg, fmt.Sprintf("ping/%s", nodeCfg.Node.ID), []byte(ncutils.Version), 0); err != nil {
 		logger.Log(0, fmt.Sprintf("error publishing ping, %v", err))
-		logger.Log(0, "running pull on "+commsCfg.Node.Network+" to reconnect")
-		_, err := Pull(commsCfg.Node.Network, true)
+		logger.Log(0, "running pull on "+nodeCfg.Node.Network+" to reconnect")
+		_, err := Pull(nodeCfg.Node.Network, true)
 		if err != nil {
-			logger.Log(0, "could not run pull on "+commsCfg.Node.Network+", error: "+err.Error())
+			logger.Log(0, "could not run pull on "+nodeCfg.Node.Network+", error: "+err.Error())
 		}
+	} else {
+		logger.Log(3, "checkin for", nodeCfg.Network, "complete")
 	}
 }
 
-// requires the commscfg in which to send traffic over and nodecfg of node that is publish the message
-// node cfg is so that the traffic keys of that node may be fetched for encryption
-func publish(commsCfg, nodeCfg *config.ClientConfig, dest string, msg []byte, qos byte) error {
+// node cfg is required  in order to fetch the traffic keys of that node for encryption
+func publish(nodeCfg *config.ClientConfig, dest string, msg []byte, qos byte) error {
 	// setup the keys
 	trafficPrivKey, err := auth.RetrieveTrafficKey(nodeCfg.Node.Network)
 	if err != nil {
 		return err
 	}
-
 	serverPubKey, err := ncutils.ConvertBytesToKey(nodeCfg.Node.TrafficKeys.Server)
 	if err != nil {
 		return err
 	}
 
-	client := setupMQTT(commsCfg, true)
+	client, err := setupMQTT(nodeCfg, true)
+	if err != nil {
+		return fmt.Errorf("mq setup error %w", err)
+	}
 	defer client.Disconnect(250)
 	encrypted, err := ncutils.Chunk(msg, serverPubKey, trafficPrivKey)
 	if err != nil {
 		return err
 	}
 
-	if token := client.Publish(dest, qos, false, encrypted); token.Wait() && token.Error() != nil {
-		return token.Error()
+	if token := client.Publish(dest, qos, false, encrypted); !token.WaitTimeout(30*time.Second) || token.Error() != nil {
+		logger.Log(0, "could not connect to broker at "+nodeCfg.Server.Server+":8883")
+		var err error
+		if token.Error() == nil {
+			err = errors.New("connection timeout")
+		} else {
+			err = token.Error()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkCertExpiry(cfg *config.ClientConfig) error {
+	cert, err := tls.ReadCert(ncutils.GetNetclientServerPath(cfg.Server.Server) + ncutils.GetSeparator() + "client.pem")
+	//if cert doesn't exist or will expire within 10 days
+	if errors.Is(err, os.ErrNotExist) || cert.NotAfter.Before(time.Now().Add(time.Hour*24*10)) {
+		key, err := tls.ReadKey(ncutils.GetNetclientPath() + ncutils.GetSeparator() + "client.key")
+		if err != nil {
+			return err
+		}
+		return RegisterWithServer(key, cfg)
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkBroker(broker string, port string) error {
+	if broker == "" {
+		return errors.New("error: broker address is blank")
+	}
+	if port == "" {
+		return errors.New("error: broker port is blank")
+	}
+	_, err := net.LookupIP(broker)
+	if err != nil {
+		return errors.New("nslookup failed for broker ... check dns records")
+	}
+	pinger := ping.NewTCPing()
+	intPort, err := strconv.Atoi(port)
+	if err != nil {
+		logger.Log(1, "error converting port to int: "+err.Error())
+	}
+	pinger.SetTarget(&ping.Target{
+		Protocol: ping.TCP,
+		Host:     broker,
+		Port:     intPort,
+		Counter:  3,
+		Interval: 1 * time.Second,
+		Timeout:  2 * time.Second,
+	})
+	pingerDone := pinger.Start()
+	<-pingerDone
+	if pinger.Result().SuccessCounter == 0 {
+		return errors.New("unable to connect to broker port ... check netmaker server and firewalls")
 	}
 	return nil
 }

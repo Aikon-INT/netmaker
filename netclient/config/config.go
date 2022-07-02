@@ -1,13 +1,14 @@
 package config
 
 import (
-	//"github.com/davecgh/go-spew/spew"
-	"encoding/base64"
-	"encoding/json"
+	"crypto/ed25519"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
@@ -16,29 +17,41 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	configLock sync.Mutex
+)
+
 // ClientConfig - struct for dealing with client configuration
 type ClientConfig struct {
-	Server          ServerConfig   `yaml:"server"`
-	Node            models.Node    `yaml:"node"`
-	NetworkSettings models.Network `yaml:"networksettings"`
-	Network         string         `yaml:"network"`
-	Daemon          string         `yaml:"daemon"`
-	OperatingSystem string         `yaml:"operatingsystem"`
-	DebugOn         bool           `yaml:"debugon"`
-	
+	Server          models.ServerConfig `yaml:"server"`
+	Node            models.Node         `yaml:"node"`
+	NetworkSettings models.Network      `yaml:"networksettings"`
+	Network         string              `yaml:"network"`
+	Daemon          string              `yaml:"daemon"`
+	OperatingSystem string              `yaml:"operatingsystem"`
+	AccessKey       string              `yaml:"accesskey"`
 }
 
-// ServerConfig - struct for dealing with the server information for a netclient
-type ServerConfig struct {
-	CoreDNSAddr  string `yaml:"corednsaddr"`
-	GRPCAddress  string `yaml:"grpcaddress"`
-	AccessKey    string `yaml:"accesskey"`
-	GRPCSSL      string `yaml:"grpcssl"`
-	CommsNetwork string `yaml:"commsnetwork"`
+// RegisterRequest - struct for registation with netmaker server
+type RegisterRequest struct {
+	Key        ed25519.PrivateKey
+	CommonName pkix.Name
+}
+
+// RegisterResponse - the response to register function
+type RegisterResponse struct {
+	CA         x509.Certificate
+	CAPubKey   ed25519.PublicKey
+	Cert       x509.Certificate
+	CertPubKey ed25519.PublicKey
+	Broker     string
+	Port       string
 }
 
 // Write - writes the config of a client to disk
 func Write(config *ClientConfig, network string) error {
+	configLock.Lock()
+	defer configLock.Unlock()
 	if network == "" {
 		err := errors.New("no network provided - exiting")
 		return err
@@ -107,8 +120,8 @@ func (config *ClientConfig) ReadConfig() {
 	}
 }
 
-// ModConfig - overwrites the node inside client config on disk
-func ModConfig(node *models.Node) error {
+// ModNodeConfig - overwrites the node inside client config on disk
+func ModNodeConfig(node *models.Node) error {
 	network := node.Network
 	if network == "" {
 		return errors.New("no network provided")
@@ -127,7 +140,22 @@ func ModConfig(node *models.Node) error {
 	return Write(&modconfig, network)
 }
 
-// ModConfig - overwrites the node inside client config on disk
+// ModNodeConfig - overwrites the server settings inside client config on disk
+func ModServerConfig(scfg *models.ServerConfig, network string) error {
+	var modconfig ClientConfig
+	if FileExists(ncutils.GetNetclientPathSpecific() + "netconfig-" + network) {
+		useconfig, err := ReadConfig(network)
+		if err != nil {
+			return err
+		}
+		modconfig = *useconfig
+	}
+
+	modconfig.Server = (*scfg)
+	return Write(&modconfig, network)
+}
+
+// SaveBackup - saves a backup file of a given network
 func SaveBackup(network string) error {
 
 	var configPath = ncutils.GetNetclientPathSpecific() + "netconfig-" + network
@@ -169,32 +197,18 @@ func ReplaceWithBackup(network string) error {
 func GetCLIConfig(c *cli.Context) (ClientConfig, string, error) {
 	var cfg ClientConfig
 	if c.String("token") != "" {
-		tokenbytes, err := base64.StdEncoding.DecodeString(c.String("token"))
+		accesstoken, err := ParseAccessToken(c.String("token"))
 		if err != nil {
-			log.Println("error decoding token")
 			return cfg, "", err
 		}
-		var accesstoken models.AccessToken
-		if err := json.Unmarshal(tokenbytes, &accesstoken); err != nil {
-			log.Println("error converting token json to object", tokenbytes)
-			return cfg, "", err
-		}
-
-		if accesstoken.ServerConfig.GRPCConnString != "" {
-			cfg.Server.GRPCAddress = accesstoken.ServerConfig.GRPCConnString
-		}
-
 		cfg.Network = accesstoken.ClientConfig.Network
 		cfg.Node.Network = accesstoken.ClientConfig.Network
-		cfg.Server.AccessKey = accesstoken.ClientConfig.Key
+		cfg.AccessKey = accesstoken.ClientConfig.Key
 		cfg.Node.LocalRange = accesstoken.ClientConfig.LocalRange
-		cfg.Server.GRPCSSL = accesstoken.ServerConfig.GRPCSSL
-		cfg.Server.CommsNetwork = accesstoken.ServerConfig.CommsNetwork
-		if c.String("grpcserver") != "" {
-			cfg.Server.GRPCAddress = c.String("grpcserver")
-		}
+		//cfg.Server.Server = accesstoken.ServerConfig.Server
+		cfg.Server.API = accesstoken.APIConnString
 		if c.String("key") != "" {
-			cfg.Server.AccessKey = c.String("key")
+			cfg.AccessKey = c.String("key")
 		}
 		if c.String("network") != "all" {
 			cfg.Network = c.String("network")
@@ -203,21 +217,19 @@ func GetCLIConfig(c *cli.Context) (ClientConfig, string, error) {
 		if c.String("localrange") != "" {
 			cfg.Node.LocalRange = c.String("localrange")
 		}
-		if c.String("grpcssl") != "" {
-			cfg.Server.GRPCSSL = c.String("grpcssl")
-		}
 		if c.String("corednsaddr") != "" {
 			cfg.Server.CoreDNSAddr = c.String("corednsaddr")
 		}
-
+		if c.String("apiserver") != "" {
+			cfg.Server.API = c.String("apiserver")
+		}
 	} else {
-		cfg.Server.GRPCAddress = c.String("grpcserver")
-		cfg.Server.AccessKey = c.String("key")
+		cfg.AccessKey = c.String("key")
 		cfg.Network = c.String("network")
 		cfg.Node.Network = c.String("network")
 		cfg.Node.LocalRange = c.String("localrange")
-		cfg.Server.GRPCSSL = c.String("grpcssl")
 		cfg.Server.CoreDNSAddr = c.String("corednsaddr")
+		cfg.Server.API = c.String("apiserver")
 	}
 	cfg.Node.Name = c.String("name")
 	cfg.Node.Interface = c.String("interface")
@@ -225,12 +237,11 @@ func GetCLIConfig(c *cli.Context) (ClientConfig, string, error) {
 	cfg.Node.MacAddress = c.String("macaddress")
 	cfg.Node.LocalAddress = c.String("localaddress")
 	cfg.Node.Address = c.String("address")
-	cfg.Node.Address6 = c.String("addressIPV6")
+	cfg.Node.Address6 = c.String("address6")
 	//cfg.Node.Roaming = c.String("roaming")
 	cfg.Node.DNSOn = c.String("dnson")
 	cfg.Node.IsLocal = c.String("islocal")
 	cfg.Node.IsStatic = c.String("isstatic")
-	cfg.Node.IsDualStack = c.String("isdualstack")
 	cfg.Node.PostUp = c.String("postup")
 	cfg.Node.PostDown = c.String("postdown")
 	cfg.Node.ListenPort = int32(c.Int("port"))

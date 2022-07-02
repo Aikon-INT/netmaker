@@ -1,6 +1,8 @@
 package command
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"strings"
 
 	"github.com/gravitl/netmaker/logger"
@@ -8,56 +10,20 @@ import (
 	"github.com/gravitl/netmaker/netclient/daemon"
 	"github.com/gravitl/netmaker/netclient/functions"
 	"github.com/gravitl/netmaker/netclient/ncutils"
+	"github.com/gravitl/netmaker/tls"
 )
-
-// JoinComms -- Join the message queue comms network if it doesn't have it
-// tries to ping if already found locally, if fail ping pull for best effort for communication
-func JoinComms(cfg *config.ClientConfig) error {
-	commsCfg := &config.ClientConfig{}
-	commsCfg.Network = cfg.Server.CommsNetwork
-	commsCfg.Node.Network = cfg.Server.CommsNetwork
-	commsCfg.Server.AccessKey = cfg.Server.AccessKey
-	commsCfg.Server.GRPCAddress = cfg.Server.GRPCAddress
-	commsCfg.Server.GRPCSSL = cfg.Server.GRPCSSL
-	commsCfg.Server.CoreDNSAddr = cfg.Server.CoreDNSAddr
-	if commsCfg.ConfigFileExists() {
-		return nil
-	}
-	commsCfg.ReadConfig()
-
-	if len(commsCfg.Node.Name) == 0 {
-		if err := functions.JoinNetwork(commsCfg, "", true); err != nil {
-			return err
-		}
-	} else { // check if comms is currently reachable
-		if err := functions.PingServer(commsCfg); err != nil {
-			if err = Pull(commsCfg); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
 
 // Join - join command to run from cli
 func Join(cfg *config.ClientConfig, privateKey string) error {
 	var err error
-	//check if comms network exists
-	if err = JoinComms(cfg); err != nil {
-		return err
-	}
-
 	//join network
-	err = functions.JoinNetwork(cfg, privateKey, false)
-	if err != nil && !cfg.DebugOn {
+	err = functions.JoinNetwork(cfg, privateKey)
+	if err != nil {
 		if !strings.Contains(err.Error(), "ALREADY_INSTALLED") {
-			logger.Log(1, "error installing: ", err.Error())
-			err = functions.LeaveNetwork(cfg.Network, true)
+			logger.Log(0, "error installing: ", err.Error())
+			err = functions.WipeLocal(cfg.Network)
 			if err != nil {
-				err = functions.WipeLocal(cfg.Network)
-				if err != nil {
-					logger.Log(1, "error removing artifacts: ", err.Error())
-				}
+				logger.Log(1, "error removing artifacts: ", err.Error())
 			}
 			if cfg.Daemon != "off" {
 				if ncutils.IsLinux() {
@@ -70,8 +36,6 @@ func Join(cfg *config.ClientConfig, privateKey string) error {
 					daemon.RemoveFreebsdDaemon()
 				}
 			}
-		} else {
-			logger.Log(0, "success")
 		}
 		if err != nil && strings.Contains(err.Error(), "ALREADY_INSTALLED") {
 			logger.Log(0, err.Error())
@@ -80,30 +44,17 @@ func Join(cfg *config.ClientConfig, privateKey string) error {
 		return err
 	}
 	logger.Log(1, "joined ", cfg.Network)
-	/*
-		if ncutils.IsWindows() {
-			logger.Log("setting up WireGuard app", 0)
-			time.Sleep(time.Second >> 1)
-			functions.Pull(cfg.Network, true)
-		}
-	*/
+
 	return err
 }
 
 // Leave - runs the leave command from cli
-func Leave(cfg *config.ClientConfig, force bool) error {
-	err := functions.LeaveNetwork(cfg.Network, force)
+func Leave(cfg *config.ClientConfig) error {
+	err := functions.LeaveNetwork(cfg.Network)
 	if err != nil {
 		logger.Log(1, "error attempting to leave network "+cfg.Network)
 	} else {
 		logger.Log(0, "success")
-	}
-	nets, err := ncutils.GetSystemNetworks()
-	if err == nil && len(nets) == 1 {
-		if nets[0] == cfg.Node.CommID {
-			logger.Log(1, "detected comms as remaining network, removing...")
-			err = functions.LeaveNetwork(nets[0], true)
-		}
 	}
 	return err
 }
@@ -111,38 +62,65 @@ func Leave(cfg *config.ClientConfig, force bool) error {
 // Pull - runs pull command from cli
 func Pull(cfg *config.ClientConfig) error {
 	var err error
+	var networks = []string{}
 	if cfg.Network == "all" {
 		logger.Log(0, "No network selected. Running Pull for all networks.")
-		networks, err := ncutils.GetSystemNetworks()
+		networks, err = ncutils.GetSystemNetworks()
 		if err != nil {
 			logger.Log(1, "Error retrieving networks. Exiting.")
 			return err
 		}
-		for _, network := range networks {
-			_, err = functions.Pull(network, true)
-			if err != nil {
-				logger.Log(1, "Error pulling network config for network: ", network, "\n", err.Error())
-			} else {
-				logger.Log(1, "pulled network config for "+network)
-			}
-		}
-		err = nil
 	} else {
-		_, err = functions.Pull(cfg.Network, true)
+		networks = append(networks, cfg.Network)
+	}
+
+	var currentServers = make(map[string]config.ClientConfig)
+
+	for _, network := range networks {
+		currCfg, err := config.ReadConfig(network)
+		if err != nil {
+			logger.Log(1, "could not read config when pulling for network", network)
+			continue
+		}
+
+		_, err = functions.Pull(network, true)
+		if err != nil {
+			logger.Log(1, "Error pulling network config for network: ", network, "\n", err.Error())
+		} else {
+			logger.Log(1, "pulled network config for "+network)
+		}
+
+		currentServers[currCfg.Server.Server] = *currCfg
+	}
+	//generate new client key if one doesn' exist
+	var private *ed25519.PrivateKey
+	private, err = tls.ReadKey(ncutils.GetNetclientPath() + ncutils.GetSeparator() + "client.key")
+	if err != nil {
+		_, newKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return err
+		}
+		if err := tls.SaveKey(ncutils.GetNetclientPath(), ncutils.GetSeparator()+"client.key", newKey); err != nil {
+			return err
+		}
+		private = &newKey
+	}
+	// re-register with server -- get new certs for broker
+	for _, clientCfg := range currentServers {
+		if err = functions.RegisterWithServer(private, &clientCfg); err != nil {
+			logger.Log(0, "registration error", err.Error())
+		} else {
+			daemon.Restart()
+		}
 	}
 	logger.Log(1, "reset network and peer configs")
-	if err == nil {
-		logger.Log(1, "reset network and peer configs")
-		logger.Log(1, "success")
-	} else {
-		logger.Log(0, "error occurred pulling configs from server")
-	}
+
 	return err
 }
 
 // List - runs list command from cli
 func List(cfg config.ClientConfig) error {
-	err := functions.List(cfg.Network)
+	_, err := functions.List(cfg.Network)
 	return err
 }
 
@@ -158,4 +136,9 @@ func Uninstall() error {
 func Daemon() error {
 	err := functions.Daemon()
 	return err
+}
+
+// Install - installs binary and daemon
+func Install() error {
+	return functions.Install()
 }

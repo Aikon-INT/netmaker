@@ -4,6 +4,8 @@ import (
 	"net"
 	"strings"
 
+	"github.com/c-robinson/iplib"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/netclient/ncutils"
 )
 
@@ -33,7 +35,13 @@ func deleteRoute(iface string, addr *net.IPNet, address string) error {
 }
 
 func setCidr(iface, address string, addr *net.IPNet) {
-	ncutils.RunCmd("route -q -n add -net "+addr.String()+" "+address, false)
+	if iplib.Version(addr.IP) == 4 {
+		ncutils.RunCmd("route -q -n add -net "+addr.String()+" "+address, false)
+	} else if iplib.Version(addr.IP) == 6 {
+		ncutils.RunCmd("route -A inet6 -q -n add -net "+addr.String()+" "+address, false)
+	} else {
+		logger.Log(1, "could not parse address: "+addr.String())
+	}
 }
 
 func removeCidr(iface string, addr *net.IPNet, address string) {

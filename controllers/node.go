@@ -19,27 +19,24 @@ import (
 
 func nodeHandlers(r *mux.Router) {
 
-	r.HandleFunc("/api/nodes", authorize(false, "user", http.HandlerFunc(getAllNodes))).Methods("GET")
-	r.HandleFunc("/api/nodes/{network}", authorize(true, "network", http.HandlerFunc(getNetworkNodes))).Methods("GET")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(true, "node", http.HandlerFunc(getNode))).Methods("GET")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(true, "node", http.HandlerFunc(updateNode))).Methods("PUT")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(true, "node", http.HandlerFunc(deleteNode))).Methods("DELETE")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}/createrelay", authorize(true, "user", http.HandlerFunc(createRelay))).Methods("POST")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}/deleterelay", authorize(true, "user", http.HandlerFunc(deleteRelay))).Methods("DELETE")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}/creategateway", authorize(true, "user", http.HandlerFunc(createEgressGateway))).Methods("POST")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}/deletegateway", authorize(true, "user", http.HandlerFunc(deleteEgressGateway))).Methods("DELETE")
+	r.HandleFunc("/api/nodes", authorize(false, false, "user", http.HandlerFunc(getAllNodes))).Methods("GET")
+	r.HandleFunc("/api/nodes/{network}", authorize(false, true, "network", http.HandlerFunc(getNetworkNodes))).Methods("GET")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(true, true, "node", http.HandlerFunc(getNode))).Methods("GET")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(false, true, "node", http.HandlerFunc(updateNode))).Methods("PUT")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}", authorize(true, true, "node", http.HandlerFunc(deleteNode))).Methods("DELETE")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}/createrelay", authorize(false, true, "user", http.HandlerFunc(createRelay))).Methods("POST")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}/deleterelay", authorize(false, true, "user", http.HandlerFunc(deleteRelay))).Methods("DELETE")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}/creategateway", authorize(false, true, "user", http.HandlerFunc(createEgressGateway))).Methods("POST")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}/deletegateway", authorize(false, true, "user", http.HandlerFunc(deleteEgressGateway))).Methods("DELETE")
 	r.HandleFunc("/api/nodes/{network}/{nodeid}/createingress", securityCheck(false, http.HandlerFunc(createIngressGateway))).Methods("POST")
 	r.HandleFunc("/api/nodes/{network}/{nodeid}/deleteingress", securityCheck(false, http.HandlerFunc(deleteIngressGateway))).Methods("DELETE")
-	r.HandleFunc("/api/nodes/{network}/{nodeid}/approve", authorize(true, "user", http.HandlerFunc(uncordonNode))).Methods("POST")
-	r.HandleFunc("/api/nodes/{network}", createNode).Methods("POST")
-	r.HandleFunc("/api/nodes/adm/{network}/lastmodified", authorize(true, "network", http.HandlerFunc(getLastModified))).Methods("GET")
+	r.HandleFunc("/api/nodes/{network}/{nodeid}/approve", authorize(false, true, "user", http.HandlerFunc(uncordonNode))).Methods("POST")
+	r.HandleFunc("/api/nodes/{network}", nodeauth(http.HandlerFunc(createNode))).Methods("POST")
+	r.HandleFunc("/api/nodes/adm/{network}/lastmodified", authorize(false, true, "network", http.HandlerFunc(getLastModified))).Methods("GET")
 	r.HandleFunc("/api/nodes/adm/{network}/authenticate", authenticate).Methods("POST")
 }
 
 func authenticate(response http.ResponseWriter, request *http.Request) {
-
-	var params = mux.Vars(request)
-	networkname := params["network"]
 
 	var authRequest models.AuthParams
 	var result models.Node
@@ -58,8 +55,8 @@ func authenticate(response http.ResponseWriter, request *http.Request) {
 		return
 	} else {
 		errorResponse.Code = http.StatusBadRequest
-		if authRequest.MacAddress == "" {
-			errorResponse.Message = "W1R3: MacAddress can't be empty"
+		if authRequest.ID == "" {
+			errorResponse.Message = "W1R3: ID can't be empty"
 			returnErrorResponse(response, request, errorResponse)
 			return
 		} else if authRequest.Password == "" {
@@ -67,22 +64,8 @@ func authenticate(response http.ResponseWriter, request *http.Request) {
 			returnErrorResponse(response, request, errorResponse)
 			return
 		} else {
-
-			collection, err := database.FetchRecords(database.NODES_TABLE_NAME)
-			if err != nil {
-				errorResponse.Code = http.StatusBadRequest
-				errorResponse.Message = err.Error()
-				returnErrorResponse(response, request, errorResponse)
-				return
-			}
-			for _, value := range collection {
-				if err := json.Unmarshal([]byte(value), &result); err != nil {
-					continue
-				}
-				if (result.ID == authRequest.ID || result.MacAddress == authRequest.MacAddress) && result.IsPending != "yes" && result.Network == networkname {
-					break
-				}
-			}
+			var err error
+			result, err = logic.GetNodeByID(authRequest.ID)
 
 			if err != nil {
 				errorResponse.Code = http.StatusBadRequest
@@ -109,10 +92,10 @@ func authenticate(response http.ResponseWriter, request *http.Request) {
 
 				var successResponse = models.SuccessResponse{
 					Code:    http.StatusOK,
-					Message: "W1R3: Device " + authRequest.MacAddress + " Authorized",
+					Message: "W1R3: Device " + authRequest.ID + " Authorized",
 					Response: models.SuccessfulLoginResponse{
-						AuthToken:  tokenString,
-						MacAddress: authRequest.MacAddress,
+						AuthToken: tokenString,
+						ID:        authRequest.ID,
 					},
 				}
 				successJSONResponse, jsonError := json.Marshal(successResponse)
@@ -131,6 +114,51 @@ func authenticate(response http.ResponseWriter, request *http.Request) {
 	}
 }
 
+// auth middleware for api calls from nodes where node is has not yet joined the server (register, join)
+func nodeauth(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bearerToken := r.Header.Get("Authorization")
+		var tokenSplit = strings.Split(bearerToken, " ")
+		var token = ""
+		if len(tokenSplit) < 2 {
+			errorResponse := models.ErrorResponse{
+				Code: http.StatusUnauthorized, Message: "W1R3: You are unauthorized to access this endpoint.",
+			}
+			returnErrorResponse(w, r, errorResponse)
+			return
+		} else {
+			token = tokenSplit[1]
+		}
+		found := false
+		networks, err := logic.GetNetworks()
+		if err != nil {
+			logger.Log(0, "no networks", err.Error())
+			errorResponse := models.ErrorResponse{
+				Code: http.StatusNotFound, Message: "no networks",
+			}
+			returnErrorResponse(w, r, errorResponse)
+			return
+		}
+		for _, network := range networks {
+			for _, key := range network.AccessKeys {
+				if key.Value == token {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			logger.Log(0, "valid access key not found")
+			errorResponse := models.ErrorResponse{
+				Code: http.StatusUnauthorized, Message: "You are unauthorized to access this endpoint.",
+			}
+			returnErrorResponse(w, r, errorResponse)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 //The middleware for most requests to the API
 //They all pass  through here first
 //This will validate the JWT (or check for master token)
@@ -138,7 +166,7 @@ func authenticate(response http.ResponseWriter, request *http.Request) {
 //even if it's technically ok
 //This is kind of a poor man's RBAC. There's probably a better/smarter way.
 //TODO: Consider better RBAC implementations
-func authorize(networkCheck bool, authNetwork string, next http.Handler) http.HandlerFunc {
+func authorize(nodesAllowed, networkCheck bool, authNetwork string, next http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var errorResponse = models.ErrorResponse{
 			Code: http.StatusInternalServerError, Message: "W1R3: It's not you it's me.",
@@ -175,6 +203,14 @@ func authorize(networkCheck bool, authNetwork string, next http.Handler) http.Ha
 				}
 				returnErrorResponse(w, r, errorResponse)
 				return
+			}
+			//check if node instead of user
+			if nodesAllowed {
+				// TODO --- should ensure that node is only operating on itself
+				if _, _, _, err := logic.VerifyToken(authToken); err == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 
 			var isAuthorized = false
@@ -329,13 +365,22 @@ func getNode(w http.ResponseWriter, r *http.Request) {
 		returnErrorResponse(w, r, formatError(err, "internal"))
 		return
 	}
-	if logic.IsNodeInComms(&node) {
+
+	peerUpdate, err := logic.GetPeerUpdate(&node)
+	if err != nil && !database.IsEmptyRecord(err) {
 		returnErrorResponse(w, r, formatError(err, "internal"))
 		return
 	}
+
+	response := models.NodeGet{
+		Node:         node,
+		Peers:        peerUpdate.Peers,
+		ServerConfig: servercfg.GetServerInfo(),
+	}
+
 	logger.Log(2, r.Header.Get("user"), "fetched node", params["nodeid"])
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(node)
+	json.NewEncoder(w).Encode(response)
 }
 
 //Get the time that a network of nodes was last modified.
@@ -395,9 +440,12 @@ func createNode(w http.ResponseWriter, r *http.Request) {
 		returnErrorResponse(w, r, formatError(err, "internal"))
 		return
 	}
-
+	node.NetworkSettings, err = logic.GetNetworkSettings(node.Network)
+	if err != nil {
+		returnErrorResponse(w, r, formatError(err, "internal"))
+		return
+	}
 	validKey := logic.IsKeyValid(networkName, node.AccessKey)
-
 	if !validKey {
 		// Check to see if network will allow manual sign up
 		// may want to switch this up with the valid key check and avoid a DB call that way.
@@ -411,6 +459,26 @@ func createNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	key, keyErr := logic.RetrievePublicTrafficKey()
+	if keyErr != nil {
+		logger.Log(0, "error retrieving key: ", keyErr.Error())
+		returnErrorResponse(w, r, formatError(err, "internal"))
+		return
+	}
+	if key == nil {
+		logger.Log(0, "error: server traffic key is nil")
+		returnErrorResponse(w, r, formatError(err, "internal"))
+		return
+	}
+	if node.TrafficKeys.Mine == nil {
+		logger.Log(0, "error: node traffic key is nil")
+		returnErrorResponse(w, r, formatError(err, "internal"))
+		return
+	}
+	node.TrafficKeys = models.TrafficKeys{
+		Mine:   node.TrafficKeys.Mine,
+		Server: key,
+	}
 
 	err = logic.CreateNode(&node)
 	if err != nil {
@@ -418,9 +486,21 @@ func createNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	peerUpdate, err := logic.GetPeerUpdate(&node)
+	if err != nil && !database.IsEmptyRecord(err) {
+		returnErrorResponse(w, r, formatError(err, "internal"))
+		return
+	}
+
+	response := models.NodeGet{
+		Node:         node,
+		Peers:        peerUpdate.Peers,
+		ServerConfig: servercfg.GetServerInfo(),
+	}
+
 	logger.Log(1, r.Header.Get("user"), "created new node", node.Name, "on network", node.Network)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(node)
+	json.NewEncoder(w).Encode(response)
 	runForceServerUpdate(&node)
 }
 
@@ -555,6 +635,10 @@ func updateNode(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	relayedUpdate := false
+	if node.IsRelayed == "yes" && (node.Address != newNode.Address || node.Address6 != newNode.Address6) {
+		relayedUpdate = true
+	}
 
 	if !servercfg.GetRce() {
 		newNode.PostDown = node.PostDown
@@ -562,6 +646,23 @@ func updateNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ifaceDelta := logic.IfaceDelta(&node, &newNode)
+	// for a hub change also need to update the existing hub
+	if newNode.IsHub == "yes" && node.IsHub != "yes" {
+		nodeToUpdate, err := logic.UnsetHub(newNode.Network)
+		if err != nil {
+			logger.Log(2, "failed to unset hubs", err.Error())
+		}
+		if err := mq.NodeUpdate(nodeToUpdate); err != nil {
+			logger.Log(2, "failed to update hub node", nodeToUpdate.Name, err.Error())
+		}
+		if nodeToUpdate.IsServer == "yes" {
+			// set ifacdelta true to force server to update peeers
+			if err := logic.ServerUpdate(nodeToUpdate, true); err != nil {
+				logger.Log(2, "failed to update server node on hub change", err.Error())
+			}
+
+		}
+	}
 
 	err = logic.UpdateNode(&node, &newNode)
 	if err != nil {
@@ -579,7 +680,9 @@ func updateNode(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-
+	if relayedUpdate {
+		updateRelay(&node, &newNode)
+	}
 	if servercfg.IsDNSMode() {
 		logic.SetDNS()
 	}
@@ -660,12 +763,45 @@ func runServerUpdate(node *models.Node, ifaceDelta bool) error {
 	return nil
 }
 
-func filterCommsNodes(nodes []models.Node) []models.Node {
-	var filterdNodes []models.Node
-	for i := range nodes {
-		if !logic.IsNodeInComms(&nodes[i]) {
-			filterdNodes = append(filterdNodes, nodes[i])
+func runForceServerUpdate(node *models.Node) {
+	go func() {
+		if err := mq.PublishPeerUpdate(node); err != nil {
+			logger.Log(1, "failed a peer update after creation of node", node.Name)
+		}
+
+		var currentServerNode, getErr = logic.GetNetworkServerLeader(node.Network)
+		if getErr == nil {
+			if err := logic.ServerUpdate(&currentServerNode, false); err != nil {
+				logger.Log(1, "server node:", currentServerNode.ID, "failed update")
+			}
+		}
+	}()
+}
+
+func isServer(node *models.Node) bool {
+	return node.IsServer == "yes"
+}
+
+func updateRelay(oldnode, newnode *models.Node) {
+	relay := logic.FindRelay(oldnode)
+	newrelay := relay
+	//check if node's address has been updated and if so, update the relayAddrs of the relay node with the updated address of the relayed node
+	if oldnode.Address != newnode.Address {
+		for i, ip := range newrelay.RelayAddrs {
+			if ip == oldnode.Address {
+				newrelay.RelayAddrs = append(newrelay.RelayAddrs[:i], relay.RelayAddrs[i+1:]...)
+				newrelay.RelayAddrs = append(newrelay.RelayAddrs, newnode.Address)
+			}
 		}
 	}
-	return filterdNodes
+	//check if node's address(v6) has been updated and if so, update the relayAddrs of the relay node with the updated address(v6) of the relayed node
+	if oldnode.Address6 != newnode.Address6 {
+		for i, ip := range newrelay.RelayAddrs {
+			if ip == oldnode.Address {
+				newrelay.RelayAddrs = append(newrelay.RelayAddrs[:i], newrelay.RelayAddrs[i+1:]...)
+				newrelay.RelayAddrs = append(newrelay.RelayAddrs, newnode.Address6)
+			}
+		}
+	}
+	logic.UpdateNode(relay, newrelay)
 }

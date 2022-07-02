@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -96,25 +95,6 @@ func UncordonNode(nodeid string) (models.Node, error) {
 	return node, err
 }
 
-// GetPeers - gets the peers of a given server node
-func GetPeers(node *models.Node) ([]models.Node, error) {
-	if IsLeader(node) {
-		setNetworkServerPeers(node)
-	}
-	peers, err := GetPeersList(node)
-	if err != nil {
-		if strings.Contains(err.Error(), RELAY_NODE_ERR) {
-			peers, err = PeerListUnRelay(node.ID, node.Network)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	return peers, nil
-}
-
 // SetIfLeader - gets the peers of a given server node
 func SetPeersIfLeader(node *models.Node) {
 	if IsLeader(node) {
@@ -141,13 +121,6 @@ func IsLeader(node *models.Node) bool {
 
 // UpdateNode - takes a node and updates another node with it's values
 func UpdateNode(currentNode *models.Node, newNode *models.Node) error {
-	var err error
-	if newNode.IsHub == "yes" && currentNode.IsHub != "yes" {
-		if err = unsetHub(newNode.Network); err != nil {
-			return err
-		}
-	}
-
 	if newNode.Address != currentNode.Address {
 		if network, err := GetParentNetwork(newNode.Network); err == nil {
 			if !IsAddressInCIDR(newNode.Address, network.AddressRange) {
@@ -160,7 +133,6 @@ func UpdateNode(currentNode *models.Node, newNode *models.Node) error {
 	if currentNode.IsServer == "yes" && !validateServer(currentNode, newNode) {
 		return fmt.Errorf("this operation is not supported on server nodes")
 	}
-
 	// check for un-settable server values
 	if err := ValidateNode(newNode, true); err != nil {
 		return err
@@ -180,6 +152,12 @@ func UpdateNode(currentNode *models.Node, newNode *models.Node) error {
 func DeleteNodeByID(node *models.Node, exterminate bool) error {
 	var err error
 	var key = node.ID
+	//delete any ext clients as required
+	if node.IsIngressGateway == "yes" {
+		if err := DeleteGatewayExtClients(node.ID, node.Network); err != nil {
+			logger.Log(0, "failed to deleted ext clients", err.Error())
+		}
+	}
 	if !exterminate {
 		node.Action = models.NODE_DELETE
 		nodedata, err := json.Marshal(&node)
@@ -207,8 +185,11 @@ func DeleteNodeByID(node *models.Node, exterminate bool) error {
 		// ignoring for now, could hit a nil pointer if delete called twice
 		logger.Log(2, "attempted to remove node ACL for node", node.Name, node.ID)
 	}
-
-	return removeLocalServer(node)
+	removeZombie <- node.ID
+	if node.IsServer == "yes" {
+		return removeLocalServer(node)
+	}
+	return nil
 }
 
 // IsNodeIDUnique - checks if node id is unique
@@ -220,16 +201,12 @@ func IsNodeIDUnique(node *models.Node) (bool, error) {
 // ValidateNode - validates node values
 func ValidateNode(node *models.Node, isUpdate bool) error {
 	v := validator.New()
-	_ = v.RegisterValidation("macaddress_unique", func(fl validator.FieldLevel) bool {
+	_ = v.RegisterValidation("id_unique", func(fl validator.FieldLevel) bool {
 		if isUpdate {
 			return true
 		}
-		var unique = true
-		if !(node.MacAddress == "") {
-			unique, _ = isMacAddressUnique(node.MacAddress, node.Network)
-		}
 		isFieldUnique, _ := IsNodeIDUnique(node)
-		return isFieldUnique && unique
+		return isFieldUnique
 	})
 	_ = v.RegisterValidation("network_exists", func(fl validator.FieldLevel) bool {
 		_, err := GetNetworkByNode(node)
@@ -270,21 +247,30 @@ func CreateNode(node *models.Node) error {
 
 	SetNodeDefaults(node)
 
-	if node.IsServer == "yes" {
-		if node.Address, err = UniqueAddressServer(node.Network); err != nil {
-			return err
+	defaultACLVal := acls.Allowed
+	parentNetwork, err := GetNetwork(node.Network)
+	if err == nil {
+		if parentNetwork.DefaultACL != "yes" {
+			defaultACLVal = acls.NotAllowed
 		}
-	} else if node.Address == "" {
-		if node.Address, err = UniqueAddress(node.Network); err != nil {
-			return err
+	}
+
+	reverse := node.IsServer == "yes"
+	if node.Address == "" {
+		if parentNetwork.IsIPv4 == "yes" {
+			if node.Address, err = UniqueAddress(node.Network, reverse); err != nil {
+				return err
+			}
 		}
 	} else if !IsIPUnique(node.Network, node.Address, database.NODES_TABLE_NAME, false) {
 		return fmt.Errorf("invalid address: ipv4 " + node.Address + " is not unique")
 	}
 
 	if node.Address6 == "" {
-		if node.Address6, err = UniqueAddress6(node.Network); err != nil {
-			return err
+		if parentNetwork.IsIPv6 == "yes" {
+			if node.Address6, err = UniqueAddress6(node.Network, reverse); err != nil {
+				return err
+			}
 		}
 	} else if !IsIPUnique(node.Network, node.Address6, database.NODES_TABLE_NAME, true) {
 		return fmt.Errorf("invalid address: ipv6 " + node.Address6 + " is not unique")
@@ -302,6 +288,7 @@ func CreateNode(node *models.Node) error {
 	if err != nil {
 		return err
 	}
+	CheckZombies(node)
 
 	nodebytes, err := json.Marshal(&node)
 	if err != nil {
@@ -310,14 +297,6 @@ func CreateNode(node *models.Node) error {
 	err = database.Insert(node.ID, string(nodebytes), database.NODES_TABLE_NAME)
 	if err != nil {
 		return err
-	}
-
-	defaultACLVal := acls.Allowed
-	parentNetwork, err := GetNetwork(node.Network)
-	if err == nil {
-		if parentNetwork.DefaultACL != "yes" {
-			defaultACLVal = acls.NotAllowed
-		}
 	}
 
 	_, err = nodeacls.CreateNodeACL(nodeacls.NetworkID(node.Network), nodeacls.NodeID(node.ID), defaultACLVal)
@@ -397,6 +376,7 @@ func SetNodeDefaults(node *models.Node) {
 
 	//TODO: Maybe I should make Network a part of the node struct. Then we can just query the Network object for stuff.
 	parentNetwork, _ := GetNetworkByNode(node)
+	node.NetworkSettings = parentNetwork
 
 	node.ExpirationDateTime = time.Now().Unix() + models.TEN_YEARS_IN_SECONDS
 
@@ -428,9 +408,7 @@ func SetNodeDefaults(node *models.Node) {
 		}
 	}
 	// == Parent Network settings ==
-	if node.IsDualStack == "" {
-		node.IsDualStack = parentNetwork.IsDualStack
-	}
+
 	if node.MTU == 0 {
 		node.MTU = parentNetwork.DefaultMTU
 	}
@@ -438,7 +416,6 @@ func SetNodeDefaults(node *models.Node) {
 	node.SetIPForwardingDefault()
 	node.SetDNSOnDefault()
 	node.SetIsLocalDefault()
-	node.SetIsDualStackDefault()
 	node.SetLastModified()
 	node.SetDefaultName()
 	node.SetLastCheckIn()
@@ -630,11 +607,6 @@ func IsLocalServer(node *models.Node) bool {
 	return node.ID != "" && local.ID == node.ID
 }
 
-// IsNodeInComms returns if node is in comms network or not
-func IsNodeInComms(node *models.Node) bool {
-	return node.Network == servercfg.GetCommsID() && node.IsServer != "yes"
-}
-
 // validateServer - make sure servers dont change port or address
 func validateServer(currentNode, newNode *models.Node) bool {
 	return (newNode.Address == currentNode.Address &&
@@ -642,47 +614,63 @@ func validateServer(currentNode, newNode *models.Node) bool {
 		newNode.IsServer == "yes")
 }
 
-// isMacAddressUnique - checks if mac is unique
-func isMacAddressUnique(macaddress string, networkName string) (bool, error) {
-
-	isunique := true
-
-	nodes, err := GetNetworkNodes(networkName)
-	if err != nil {
-		if database.IsEmptyRecord(err) {
-			return true, nil
-		}
-		return false, err
-	}
-
-	for _, node := range nodes {
-
-		if node.MacAddress == macaddress {
-			isunique = false
-		}
-	}
-
-	return isunique, nil
-}
-
 // unsetHub - unset hub on network nodes
-func unsetHub(networkName string) error {
-
+func UnsetHub(networkName string) (*models.Node, error) {
+	var nodesToUpdate models.Node
 	nodes, err := GetNetworkNodes(networkName)
 	if err != nil {
-		return err
+		return &nodesToUpdate, err
 	}
 
 	for i := range nodes {
 		if nodes[i].IsHub == "yes" {
 			nodes[i].IsHub = "no"
+			nodesToUpdate = nodes[i]
 			newNodeData, err := json.Marshal(&nodes[i])
 			if err != nil {
 				logger.Log(1, "error on node during hub update")
-				return err
+				return &nodesToUpdate, err
 			}
 			database.Insert(nodes[i].ID, string(newNodeData), database.NODES_TABLE_NAME)
 		}
 	}
+	return &nodesToUpdate, nil
+}
+
+// FindRelay - returns the node that is the relay for a relayed node
+func FindRelay(node *models.Node) *models.Node {
+	if node.IsRelayed == "no" {
+		return nil
+	}
+	peers, err := GetNetworkNodes(node.Network)
+	if err != nil {
+		return nil
+	}
+	for _, peer := range peers {
+		if peer.IsRelay == "no" {
+			continue
+		}
+		for _, ip := range peer.RelayAddrs {
+			if ip == node.Address || ip == node.Address6 {
+				return &peer
+			}
+		}
+	}
 	return nil
+}
+
+func findNode(ip string) (*models.Node, error) {
+	nodes, err := GetAllNodes()
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range nodes {
+		if node.Address == ip {
+			return &node, nil
+		}
+		if node.Address6 == ip {
+			return &node, nil
+		}
+	}
+	return nil, errors.New("node not found")
 }

@@ -2,13 +2,12 @@ package ncutils
 
 import (
 	"bytes"
-	"crypto/tls"
+	"crypto/rand"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -20,18 +19,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c-robinson/iplib"
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
-// Version - version of the netclient
-var Version = "dev"
-
-// src - for random strings
-var src = rand.NewSource(time.Now().UnixNano())
+var (
+	// Version - version of the netclient
+	Version = "dev"
+)
 
 // MAX_NAME_LENGTH - maximum node name length
 const MAX_NAME_LENGTH = 62
@@ -46,7 +42,7 @@ const NO_DB_RECORDS = "could not find any records"
 const LINUX_APP_DATA_PATH = "/etc/netclient"
 
 // WINDOWS_APP_DATA_PATH - windows path
-const WINDOWS_APP_DATA_PATH = "C:\\ProgramData\\Netclient"
+const WINDOWS_APP_DATA_PATH = "C:\\Program Files (x86)\\Netclient"
 
 // WINDOWS_APP_DATA_PATH - windows path
 //const WINDOWS_WG_DPAPI_PATH = "C:\\Program Files\\WireGuard\\Data\\Configurations"
@@ -64,7 +60,6 @@ const DEFAULT_GC_PERCENT = 10
 const KEY_SIZE = 2048
 
 // constants for random strings
-const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 const (
 	letterIdxBits = 6                    // 6 bits to represent a letter index
 	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
@@ -127,23 +122,6 @@ func IsEmptyRecord(err error) bool {
 	return strings.Contains(err.Error(), NO_DB_RECORD) || strings.Contains(err.Error(), NO_DB_RECORDS)
 }
 
-//generate an access key value
-// GenPass - generates a pass
-func GenPass() string {
-
-	var seededRand *rand.Rand = rand.New(
-		rand.NewSource(time.Now().UnixNano()))
-
-	length := 16
-	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[seededRand.Intn(len(charset))]
-	}
-	return string(b)
-}
-
 // GetPublicIP - gets public ip
 func GetPublicIP() (string, error) {
 
@@ -151,7 +129,10 @@ func GetPublicIP() (string, error) {
 	endpoint := ""
 	var err error
 	for _, ipserver := range iplist {
-		resp, err := http.Get(ipserver)
+		client := &http.Client{
+			Timeout: time.Second * 10,
+		}
+		resp, err := client.Get(ipserver)
 		if err != nil {
 			continue
 		}
@@ -185,37 +166,6 @@ func GetMacAddr() ([]string, error) {
 		}
 	}
 	return as, nil
-}
-
-func parsePeers(keepalive int32, peers []wgtypes.PeerConfig) (string, error) {
-	peersString := ""
-	if keepalive <= 0 {
-		keepalive = 0
-	}
-
-	for _, peer := range peers {
-		endpointString := ""
-		if peer.Endpoint != nil && peer.Endpoint.String() != "" {
-			endpointString += "Endpoint = " + peer.Endpoint.String()
-		}
-		newAllowedIps := []string{}
-		for _, allowedIP := range peer.AllowedIPs {
-			newAllowedIps = append(newAllowedIps, allowedIP.String())
-		}
-		peersString += fmt.Sprintf(`[Peer]
-PublicKey = %s
-AllowedIps = %s
-PersistentKeepAlive = %s
-%s
-
-`,
-			peer.PublicKey.String(),
-			strings.Join(newAllowedIps, ","),
-			strconv.Itoa(int(keepalive)),
-			endpointString,
-		)
-	}
-	return peersString, nil
 }
 
 // GetLocalIP - gets local ip of machine
@@ -321,6 +271,15 @@ func GetNetclientPath() string {
 	}
 }
 
+// GetSeparator - gets the separator for OS
+func GetSeparator() string {
+	if IsWindows() {
+		return "\\"
+	} else {
+		return "/"
+	}
+}
+
 // GetFileWithRetry - retry getting file X number of times before failing
 func GetFileWithRetry(path string, retryCount int) ([]byte, error) {
 	var data []byte
@@ -335,6 +294,17 @@ func GetFileWithRetry(path string, retryCount int) ([]byte, error) {
 		}
 	}
 	return data, err
+}
+
+// GetNetclientServerPath - gets netclient server path
+func GetNetclientServerPath(server string) string {
+	if IsWindows() {
+		return WINDOWS_APP_DATA_PATH + "\\" + server + "\\"
+	} else if IsMac() {
+		return "/etc/netclient/" + server + "/"
+	} else {
+		return LINUX_APP_DATA_PATH + "/" + server
+	}
 }
 
 // GetNetclientPathSpecific - gets specific netclient config path
@@ -388,17 +358,6 @@ func GetWGPathSpecific() string {
 	} else {
 		return "/etc/wireguard/"
 	}
-}
-
-// GRPCRequestOpts - gets grps request opts
-func GRPCRequestOpts(isSecure string) grpc.DialOption {
-	var requestOpts grpc.DialOption
-	requestOpts = grpc.WithInsecure()
-	if isSecure == "on" {
-		h2creds := credentials.NewTLS(&tls.Config{NextProtos: []string{"h2"}})
-		requestOpts = grpc.WithTransportCredentials(h2creds)
-	}
-	return requestOpts
 }
 
 // Copy - copies a src file to dest
@@ -478,19 +437,6 @@ func GetSystemNetworks() ([]string, error) {
 		networks = append(networks, strings.Join(temp[1:], "-"))
 	}
 	return networks, nil
-}
-
-func stringAfter(original string, substring string) string {
-	position := strings.LastIndex(original, substring)
-	if position == -1 {
-		return ""
-	}
-	adjustedPosition := position + len(substring)
-
-	if adjustedPosition >= len(original) {
-		return ""
-	}
-	return original[adjustedPosition:]
 }
 
 // ShortenString - Brings string down to specified length. Stops names from being too long
@@ -592,20 +538,39 @@ func ServerAddrSliceContains(slice []models.ServerAddr, item models.ServerAddr) 
 
 // MakeRandomString - generates a random string of len n
 func MakeRandomString(n int) string {
-	sb := strings.Builder{}
-	sb.Grow(n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			sb.WriteByte(letterBytes[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+	const validChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	result := make([]byte, n)
+	if _, err := rand.Reader.Read(result); err != nil {
+		return ""
 	}
+	for i, b := range result {
+		result[i] = validChars[b%byte(len(validChars))]
+	}
+	return string(result)
+}
 
-	return sb.String()
+func GetIPNetFromString(ip string) (net.IPNet, error) {
+	var ipnet *net.IPNet
+	var err error
+	// parsing as a CIDR first. If valid CIDR, append
+	if _, cidr, err := net.ParseCIDR(ip); err == nil {
+		ipnet = cidr
+	} else { // parsing as an IP second. If valid IP, check if ipv4 or ipv6, then append
+		if iplib.Version(net.ParseIP(ip)) == 4 {
+			ipnet = &net.IPNet{
+				IP:   net.ParseIP(ip),
+				Mask: net.CIDRMask(32, 32),
+			}
+		} else if iplib.Version(net.ParseIP(ip)) == 6 {
+			ipnet = &net.IPNet{
+				IP:   net.ParseIP(ip),
+				Mask: net.CIDRMask(128, 128),
+			}
+		}
+	}
+	if ipnet == nil {
+		err = errors.New(ip + " is not a valid ip or cidr")
+		return net.IPNet{}, err
+	}
+	return *ipnet, err
 }

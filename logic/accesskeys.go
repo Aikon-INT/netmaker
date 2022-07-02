@@ -16,10 +16,6 @@ import (
 	"github.com/gravitl/netmaker/servercfg"
 )
 
-const (
-	charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-)
-
 // CreateAccessKey - create access key
 func CreateAccessKey(accesskey models.AccessKey, network models.Network) (models.AccessKey, error) {
 
@@ -28,7 +24,7 @@ func CreateAccessKey(accesskey models.AccessKey, network models.Network) (models
 	}
 
 	if accesskey.Value == "" {
-		accesskey.Value = genKey()
+		accesskey.Value = GenKey()
 	}
 	if accesskey.Uses == 0 {
 		accesskey.Uses = 1
@@ -51,19 +47,9 @@ func CreateAccessKey(accesskey models.AccessKey, network models.Network) (models
 
 	netID := network.NetID
 
-	commsNetID, err := FetchCommsNetID()
-	if err != nil {
-		return models.AccessKey{}, errors.New("could not retrieve comms netid")
-	}
-
 	var accessToken models.AccessToken
-	s := servercfg.GetServerConfig()
-	servervals := models.ServerConfig{
-		GRPCConnString: s.GRPCConnString,
-		GRPCSSL:        s.GRPCSSL,
-		CommsNetwork:   commsNetID,
-	}
-	accessToken.ServerConfig = servervals
+
+	accessToken.APIConnString = servercfg.GetAPIConnString()
 	accessToken.ClientConfig.Network = netID
 	accessToken.ClientConfig.Key = accesskey.Value
 	accessToken.ClientConfig.LocalRange = privAddr
@@ -149,7 +135,7 @@ func DecrimentKey(networkName string, keyvalue string) {
 	var network models.Network
 
 	network, err := GetParentNetwork(networkName)
-	if err != nil || network.IsComms == "yes" {
+	if err != nil {
 		return
 	}
 
@@ -182,9 +168,6 @@ func IsKeyValid(networkname string, keyvalue string) bool {
 		return false
 	}
 	accesskeys := network.AccessKeys
-	if network.IsComms == "yes" {
-		accesskeys = getAllAccessKeys()
-	}
 
 	var key models.AccessKey
 	foundkey := false
@@ -238,19 +221,7 @@ func genKeyName() string {
 	return strings.Join([]string{"key", entropy.Text(16)[:16]}, "-")
 }
 
-func genKey() string {
+func GenKey() string {
 	entropy, _ := rand.Int(rand.Reader, maxentropy)
 	return entropy.Text(16)[:16]
-}
-
-func getAllAccessKeys() []models.AccessKey {
-	var accesskeys = make([]models.AccessKey, 0)
-	networks, err := GetNetworks()
-	if err != nil {
-		return accesskeys
-	}
-	for i := range networks {
-		accesskeys = append(accesskeys, networks[i].AccessKeys...)
-	}
-	return accesskeys
 }

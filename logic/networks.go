@@ -1,7 +1,6 @@
 package logic
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/c-robinson/iplib"
 	"github.com/go-playground/validator/v10"
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/logger"
@@ -173,38 +173,7 @@ func GetNetworkSettings(networkname string) (models.Network, error) {
 }
 
 // UniqueAddress - see if address is unique
-func UniqueAddress(networkName string) (string, error) {
-
-	var network models.Network
-	network, err := GetParentNetwork(networkName)
-	if err != nil {
-		fmt.Println("UniqueAddress encountered  an error")
-		return "666", err
-	}
-
-	offset := true
-	ip, ipnet, err := net.ParseCIDR(network.AddressRange)
-	if err != nil {
-		fmt.Println("UniqueAddress encountered  an error")
-		return "666", err
-	}
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); Inc(ip) {
-		if offset {
-			offset = false
-			continue
-		}
-		if IsIPUnique(networkName, ip.String(), database.NODES_TABLE_NAME, false) && IsIPUnique(networkName, ip.String(), database.EXT_CLIENT_TABLE_NAME, false) {
-			return ip.String(), err
-		}
-	}
-
-	//TODO
-	err1 := errors.New("ERROR: No unique addresses available. Check network subnet")
-	return "W1R3: NO UNIQUE ADDRESSES AVAILABLE", err1
-}
-
-// UniqueAddressServer - get unique address starting from last available
-func UniqueAddressServer(networkName string) (string, error) {
+func UniqueAddress(networkName string, reverse bool) (string, error) {
 
 	var network models.Network
 	network, err := GetParentNetwork(networkName)
@@ -213,31 +182,37 @@ func UniqueAddressServer(networkName string) (string, error) {
 		return "666", err
 	}
 
-	_, ipv4Net, err := net.ParseCIDR(network.AddressRange)
-	if err != nil {
-		logger.Log(0, "UniqueAddressServer encountered  an error")
+	if network.IsIPv4 == "no" {
+		return "", fmt.Errorf("IPv4 not active on network " + networkName)
+	}
+	//ensure AddressRange is valid
+	if _, _, err := net.ParseCIDR(network.AddressRange); err != nil {
+		logger.Log(0, "UniqueAddress encountered  an error")
 		return "666", err
 	}
+	net4 := iplib.Net4FromStr(network.AddressRange)
+	newAddrs := net4.FirstAddress()
 
-	// convert IPNet struct mask and address to uint32
-	// network is BigEndian
-	mask := binary.BigEndian.Uint32(ipv4Net.Mask)
-	start := binary.BigEndian.Uint32(ipv4Net.IP)
+	if reverse {
+		newAddrs = net4.LastAddress()
+	}
 
-	// find the final address
-	finish := (start & mask) | (mask ^ 0xffffffff)
-
-	// loop through addresses as uint32
-	for i := finish - 1; i > start; i-- {
-		// convert back to net.IP
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, i)
-		if IsIPUnique(networkName, ip.String(), database.NODES_TABLE_NAME, false) && IsIPUnique(networkName, ip.String(), database.EXT_CLIENT_TABLE_NAME, false) {
-			return ip.String(), err
+	for {
+		if IsIPUnique(networkName, newAddrs.String(), database.NODES_TABLE_NAME, false) &&
+			IsIPUnique(networkName, newAddrs.String(), database.EXT_CLIENT_TABLE_NAME, false) {
+			return newAddrs.String(), nil
+		}
+		if reverse {
+			newAddrs, err = net4.PreviousIP(newAddrs)
+		} else {
+			newAddrs, err = net4.NextIP(newAddrs)
+		}
+		if err != nil {
+			break
 		}
 	}
 
-	return "W1R3: NO UNIQUE ADDRESSES AVAILABLE", fmt.Errorf("no unique server addresses found")
+	return "W1R3: NO UNIQUE ADDRESSES AVAILABLE", errors.New("ERROR: No unique addresses available. Check network subnet")
 }
 
 // IsIPUnique - checks if an IP is unique
@@ -270,7 +245,7 @@ func IsIPUnique(network string, ip string, tableName string, isIpv6 bool) bool {
 }
 
 // UniqueAddress6 - see if ipv6 address is unique
-func UniqueAddress6(networkName string) (string, error) {
+func UniqueAddress6(networkName string, reverse bool) (string, error) {
 
 	var network models.Network
 	network, err := GetParentNetwork(networkName)
@@ -278,28 +253,38 @@ func UniqueAddress6(networkName string) (string, error) {
 		fmt.Println("Network Not Found")
 		return "", err
 	}
-	if network.IsDualStack == "no" {
-		return "", nil
+	if network.IsIPv6 == "no" {
+		return "", fmt.Errorf("IPv6 not active on network " + networkName)
 	}
 
-	offset := true
-	ip, ipnet, err := net.ParseCIDR(network.AddressRange6)
-	if err != nil {
-		fmt.Println("UniqueAddress6 encountered  an error")
+	//ensure AddressRange is valid
+	if _, _, err := net.ParseCIDR(network.AddressRange6); err != nil {
 		return "666", err
 	}
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); Inc(ip) {
-		if offset {
-			offset = false
-			continue
+	net6 := iplib.Net6FromStr(network.AddressRange6)
+	newAddrs := net6.FirstAddress()
+
+	if reverse {
+		newAddrs = net6.LastAddress()
+	}
+
+	for {
+
+		if IsIPUnique(networkName, newAddrs.String(), database.NODES_TABLE_NAME, true) &&
+			IsIPUnique(networkName, newAddrs.String(), database.EXT_CLIENT_TABLE_NAME, true) {
+			return newAddrs.String(), nil
 		}
-		if IsIPUnique(networkName, ip.String(), database.NODES_TABLE_NAME, true) {
-			return ip.String(), err
+		if reverse {
+			newAddrs, err = net6.PreviousIP(newAddrs)
+		} else {
+			newAddrs, err = net6.NextIP(newAddrs)
+		}
+		if err != nil {
+			break
 		}
 	}
-	//TODO
-	err1 := errors.New("ERROR: No unique addresses available. Check network subnet")
-	return "W1R3: NO UNIQUE ADDRESSES AVAILABLE", err1
+
+	return "W1R3: NO UNIQUE ADDRESSES AVAILABLE", errors.New("ERROR: No unique IPv6 addresses available. Check network subnet")
 }
 
 // GetLocalIP - gets the local ip
@@ -380,9 +365,9 @@ func UpdateNetworkLocalAddresses(networkName string) error {
 			var ipaddr string
 			var iperr error
 			if node.IsServer == "yes" {
-				ipaddr, iperr = UniqueAddressServer(networkName)
+				ipaddr, iperr = UniqueAddress(networkName, true)
 			} else {
-				ipaddr, iperr = UniqueAddress(networkName)
+				ipaddr, iperr = UniqueAddress(networkName, false)
 			}
 			if iperr != nil {
 				fmt.Println("error in node  address assignment!")
@@ -441,7 +426,6 @@ func RemoveNetworkNodeIPv6Addresses(networkName string) error {
 			return err
 		}
 		if node.Network == networkName {
-			node.IsDualStack = "no"
 			node.Address6 = ""
 			data, err := json.Marshal(&node)
 			if err != nil {
@@ -467,23 +451,64 @@ func UpdateNetworkNodeAddresses(networkName string) error {
 		var node models.Node
 		err := json.Unmarshal([]byte(value), &node)
 		if err != nil {
-			fmt.Println("error in node address assignment!")
+			logger.Log(1, "error in node ipv4 address assignment!")
 			return err
 		}
 		if node.Network == networkName {
 			var ipaddr string
 			var iperr error
 			if node.IsServer == "yes" {
-				ipaddr, iperr = UniqueAddressServer(networkName)
+				ipaddr, iperr = UniqueAddress(networkName, true)
 			} else {
-				ipaddr, iperr = UniqueAddress(networkName)
+				ipaddr, iperr = UniqueAddress(networkName, false)
 			}
 			if iperr != nil {
-				fmt.Println("error in node  address assignment!")
+				logger.Log(1, "error in node ipv4 address assignment!")
 				return iperr
 			}
 
 			node.Address = ipaddr
+			data, err := json.Marshal(&node)
+			if err != nil {
+				return err
+			}
+			database.Insert(node.ID, string(data), database.NODES_TABLE_NAME)
+		}
+	}
+
+	return nil
+}
+
+// UpdateNetworkNodeAddresses6 - updates network node addresses
+func UpdateNetworkNodeAddresses6(networkName string) error {
+
+	collections, err := database.FetchRecords(database.NODES_TABLE_NAME)
+	if err != nil {
+		return err
+	}
+
+	for _, value := range collections {
+
+		var node models.Node
+		err := json.Unmarshal([]byte(value), &node)
+		if err != nil {
+			logger.Log(1, "error in node ipv6 address assignment!")
+			return err
+		}
+		if node.Network == networkName {
+			var ipaddr string
+			var iperr error
+			if node.IsServer == "yes" {
+				ipaddr, iperr = UniqueAddress6(networkName, true)
+			} else {
+				ipaddr, iperr = UniqueAddress6(networkName, false)
+			}
+			if iperr != nil {
+				logger.Log(1, "error in node ipv6 address assignment!")
+				return iperr
+			}
+
+			node.Address6 = ipaddr
 			data, err := json.Marshal(&node)
 			if err != nil {
 				return err
@@ -517,34 +542,25 @@ func IsNetworkNameUnique(network *models.Network) (bool, error) {
 }
 
 // UpdateNetwork - updates a network with another network's fields
-func UpdateNetwork(currentNetwork *models.Network, newNetwork *models.Network) (bool, bool, bool, error) {
+func UpdateNetwork(currentNetwork *models.Network, newNetwork *models.Network) (bool, bool, bool, bool, error) {
 	if err := ValidateNetwork(newNetwork, true); err != nil {
-		return false, false, false, err
+		return false, false, false, false, err
 	}
 	if newNetwork.NetID == currentNetwork.NetID {
-		hasrangeupdate := newNetwork.AddressRange != currentNetwork.AddressRange
+		hasrangeupdate4 := newNetwork.AddressRange != currentNetwork.AddressRange
+		hasrangeupdate6 := newNetwork.AddressRange6 != currentNetwork.AddressRange6
 		localrangeupdate := newNetwork.LocalRange != currentNetwork.LocalRange
 		hasholepunchupdate := newNetwork.DefaultUDPHolePunch != currentNetwork.DefaultUDPHolePunch
 		data, err := json.Marshal(newNetwork)
 		if err != nil {
-			return false, false, false, err
+			return false, false, false, false, err
 		}
 		newNetwork.SetNetworkLastModified()
 		err = database.Insert(newNetwork.NetID, string(data), database.NETWORKS_TABLE_NAME)
-		return hasrangeupdate, localrangeupdate, hasholepunchupdate, err
+		return hasrangeupdate4, hasrangeupdate6, localrangeupdate, hasholepunchupdate, err
 	}
 	// copy values
-	return false, false, false, errors.New("failed to update network " + newNetwork.NetID + ", cannot change netid.")
-}
-
-// Inc - increments an IP
-func Inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
+	return false, false, false, false, errors.New("failed to update network " + newNetwork.NetID + ", cannot change netid.")
 }
 
 // GetNetwork - gets a network from database
@@ -561,20 +577,20 @@ func GetNetwork(networkname string) (models.Network, error) {
 	return network, nil
 }
 
-// Network.NetIDInNetworkCharSet - checks if a netid of a network uses valid characters
+// NetIDInNetworkCharSet - checks if a netid of a network uses valid characters
 func NetIDInNetworkCharSet(network *models.Network) bool {
 
 	charset := "abcdefghijklmnopqrstuvwxyz1234567890-_."
 
 	for _, char := range network.NetID {
-		if !strings.Contains(charset, strings.ToLower(string(char))) {
+		if !strings.Contains(charset, string(char)) {
 			return false
 		}
 	}
 	return true
 }
 
-// Network.Validate - validates fields of an network struct
+// Validate - validates fields of an network struct
 func ValidateNetwork(network *models.Network, isUpdate bool) error {
 	v := validator.New()
 	_ = v.RegisterValidation("netid_valid", func(fl validator.FieldLevel) bool {
@@ -637,7 +653,7 @@ func KeyUpdate(netname string) (models.Network, error) {
 	return models.Network{}, nil
 }
 
-//SaveNetwork - save network struct to database
+// SaveNetwork - save network struct to database
 func SaveNetwork(network *models.Network) error {
 	data, err := json.Marshal(network)
 	if err != nil {
@@ -668,7 +684,7 @@ func networkNodesUpdateAction(networkName string, action string) error {
 			fmt.Println("error in node address assignment!")
 			return err
 		}
-		if action == models.NODE_UPDATE_KEY && node.IsStatic == "yes" {
+		if action == models.NODE_UPDATE_KEY {
 			continue
 		}
 		if node.Network == networkName {

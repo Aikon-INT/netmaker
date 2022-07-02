@@ -50,7 +50,6 @@ func SetDNS() error {
 // GetDNS - gets the DNS of a current network
 func GetDNS(network string) ([]models.DNSEntry, error) {
 
-	var dns []models.DNSEntry
 	dns, err := GetNodeDNS(network)
 	if err != nil && !database.IsEmptyRecord(err) {
 		return dns, err
@@ -120,7 +119,7 @@ func SetCorefile(domains string) error {
 
 	_, err = os.Stat(dir + "/config/dnsconfig")
 	if os.IsNotExist(err) {
-		err = os.MkdirAll(dir+"/config/dnsconfig", 744)
+		err = os.MkdirAll(dir+"/config/dnsconfig", 0744)
 	}
 	if err != nil {
 		logger.Log(0, "couldnt find or create /config/dnsconfig")

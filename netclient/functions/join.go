@@ -1,31 +1,30 @@
 package functions
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"runtime"
 
-	nodepb "github.com/gravitl/netmaker/grpc"
 	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/netclient/auth"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/daemon"
 	"github.com/gravitl/netmaker/netclient/local"
 	"github.com/gravitl/netmaker/netclient/ncutils"
-	"github.com/gravitl/netmaker/netclient/server"
 	"github.com/gravitl/netmaker/netclient/wireguard"
 	"golang.org/x/crypto/nacl/box"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"google.golang.org/grpc"
 )
 
 // JoinNetwork - helps a client join a network
-func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) error {
+func JoinNetwork(cfg *config.ClientConfig, privateKey string) error {
 	if cfg.Node.Network == "" {
 		return errors.New("no network provided")
 	}
@@ -41,7 +40,11 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 		return err
 	}
 	if cfg.Node.Password == "" {
-		cfg.Node.Password = ncutils.GenPass()
+		cfg.Node.Password = logic.GenKey()
+	}
+	//check if ListenPort was set on command line
+	if cfg.Node.ListenPort != 0 {
+		cfg.Node.UDPHolePunch = "no"
 	}
 	var trafficPubKey, trafficPrivKey, errT = box.GenerateKey(rand.Reader) // generate traffic keys
 	if errT != nil {
@@ -101,7 +104,7 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 	// Find and set node MacAddress
 	if cfg.Node.MacAddress == "" {
 		macs, err := ncutils.GetMacAddr()
-		if err != nil || iscomms {
+		if err != nil {
 			//if macaddress can't be found set to random string
 			cfg.Node.MacAddress = ncutils.MakeRandomString(18)
 		} else {
@@ -109,57 +112,37 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 		}
 	}
 
-	//	if ncutils.IsLinux() {
-	//		_, err := exec.LookPath("resolvectl")
-	//		if err != nil {
-	//			logger.Log("resolvectl not present", 2)
-	//			logger.Log("unable to configure DNS automatically, disabling automated DNS management", 2)
-	//			cfg.Node.DNSOn = "no"
-	//		}
-	//	}
 	if ncutils.IsFreeBSD() {
 		cfg.Node.UDPHolePunch = "no"
 	}
 	// make sure name is appropriate, if not, give blank name
 	cfg.Node.Name = formatName(cfg.Node)
-	// differentiate between client/server here
-	var node = models.Node{
-		Password:   cfg.Node.Password,
-		Address:    cfg.Node.Address,
-		Address6:   cfg.Node.Address6,
-		ID:         cfg.Node.ID,
-		MacAddress: cfg.Node.MacAddress,
-		AccessKey:  cfg.Server.AccessKey,
-		IsStatic:   cfg.Node.IsStatic,
-		//Roaming:             cfg.Node.Roaming,
-		Network:             cfg.Network,
-		ListenPort:          cfg.Node.ListenPort,
-		PostUp:              cfg.Node.PostUp,
-		PostDown:            cfg.Node.PostDown,
-		PersistentKeepalive: cfg.Node.PersistentKeepalive,
-		LocalAddress:        cfg.Node.LocalAddress,
-		Interface:           cfg.Node.Interface,
-		PublicKey:           cfg.Node.PublicKey,
-		DNSOn:               cfg.Node.DNSOn,
-		Name:                cfg.Node.Name,
-		Endpoint:            cfg.Node.Endpoint,
-		UDPHolePunch:        cfg.Node.UDPHolePunch,
-		TrafficKeys:         cfg.Node.TrafficKeys,
-		OS:                  runtime.GOOS,
-		Version:             ncutils.Version,
-	}
-
-	logger.Log(0, "joining "+cfg.Network+" at "+cfg.Server.GRPCAddress)
-	var wcclient nodepb.NodeServiceClient
-
-	conn, err := grpc.Dial(cfg.Server.GRPCAddress,
-		ncutils.GRPCRequestOpts(cfg.Server.GRPCSSL))
-
+	cfg.Node.OS = runtime.GOOS
+	cfg.Node.Version = ncutils.Version
+	cfg.Node.AccessKey = cfg.AccessKey
+	//not sure why this is needed ... setnode defaults should take care of this on server
+	cfg.Node.IPForwarding = "yes"
+	logger.Log(0, "joining "+cfg.Network+" at "+cfg.Server.API)
+	url := "https://" + cfg.Server.API + "/api/nodes/" + cfg.Network
+	response, err := API(cfg.Node, http.MethodPost, url, cfg.AccessKey)
 	if err != nil {
-		log.Fatalf("Unable to establish client connection to "+cfg.Server.GRPCAddress+": %v", err)
+		return fmt.Errorf("error creating node %w", err)
 	}
-	defer conn.Close()
-	wcclient = nodepb.NewNodeServiceClient(conn)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		bodybytes, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("error creating node %s %s", response.Status, string(bodybytes))
+	}
+	var nodeGET models.NodeGet
+	if err := json.NewDecoder(response.Body).Decode(&nodeGET); err != nil {
+		//not sure the next line will work as response.Body probably needs to be reset before it can be read again
+		bodybytes, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("error decoding node from server %w %s", err, string(bodybytes))
+	}
+	node := nodeGET.Node
+	if nodeGET.Peers == nil {
+		nodeGET.Peers = []wgtypes.PeerConfig{}
+	}
 
 	// safety check. If returned node from server is local, but not currently configured as local, set to local addr
 	if cfg.Node.IsLocal != "yes" && node.IsLocal == "yes" && node.LocalRange != "" {
@@ -173,6 +156,7 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 		node.UDPHolePunch = "no"
 		cfg.Node.IsStatic = "yes"
 	}
+	cfg.Server = nodeGET.ServerConfig
 
 	err = wireguard.StorePrivKey(privateKey, cfg.Network)
 	if err != nil {
@@ -182,39 +166,16 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 		logger.Log(0, "Node is marked as PENDING.")
 		logger.Log(0, "Awaiting approval from Admin before configuring WireGuard.")
 		if cfg.Daemon != "off" {
-			return daemon.InstallDaemon(cfg)
+			return daemon.InstallDaemon()
 		}
 	}
-	data, err := json.Marshal(&node)
-	if err != nil {
-		return err
-	}
-	// Create node on server
-	res, err := wcclient.CreateNode(
-		context.TODO(),
-		&nodepb.Object{
-			Data: string(data),
-			Type: nodepb.NODE_TYPE,
-		},
-	)
-	if err != nil {
-		return err
-	}
 	logger.Log(1, "node created on remote server...updating configs")
-
-	// keep track of the old listenport value
-	oldListenPort := node.ListenPort
-
-	nodeData := res.Data
-	if err = json.Unmarshal([]byte(nodeData), &node); err != nil {
+	cfg.Node = node
+	err = config.ModNodeConfig(&cfg.Node)
+	if err != nil {
 		return err
 	}
-
-	cfg.Node = node
-
-	setListenPort(oldListenPort, cfg)
-
-	err = config.ModConfig(&cfg.Node)
+	err = config.ModServerConfig(&cfg.Server, node.Network)
 	if err != nil {
 		return err
 	}
@@ -222,45 +183,30 @@ func JoinNetwork(cfg *config.ClientConfig, privateKey string, iscomms bool) erro
 	if err = config.SaveBackup(node.Network); err != nil {
 		logger.Log(0, "failed to make backup, node will not auto restore if config is corrupted")
 	}
-
-	logger.Log(0, "retrieving peers")
-	peers, hasGateway, gateways, err := server.GetPeers(node.MacAddress, cfg.Network, cfg.Server.GRPCAddress, node.IsDualStack == "yes", node.IsIngressGateway == "yes", node.IsServer == "yes")
-	if err != nil && !ncutils.IsEmptyRecord(err) {
-		logger.Log(0, "failed to retrieve peers")
-		return err
-	}
-
 	logger.Log(0, "starting wireguard")
-	err = wireguard.InitWireguard(&node, privateKey, peers, hasGateway, gateways, false)
+	err = wireguard.InitWireguard(&node, privateKey, nodeGET.Peers[:], false)
 	if err != nil {
 		return err
 	}
-	//	if node.DNSOn == "yes" {
-	//		for _, server := range node.NetworkSettings.DefaultServerAddrs {
-	//			if server.IsLeader {
-	//				go func() {
-	//					if !local.SetDNSWithRetry(node, server.Address) {
-	//						cfg.Node.DNSOn = "no"
-	//						var currentCommsCfg = getCommsCfgByNode(&cfg.Node)
-	//						PublishNodeUpdate(&currentCommsCfg, &cfg)
-	//					}
-	//				}()
-	//				break
-	//			}
-	//		}
-	//	}
+	if err := Register(cfg); err != nil {
+		return err
+	}
+	if cfg.Server.Server == "" {
+		return errors.New("did not receive broker address from registration")
+	}
+	// update server with latest data
+	if err := PublishNodeUpdate(cfg); err != nil {
+		logger.Log(0, "failed to publish update for join", err.Error())
+	}
 
-	if !iscomms {
-		if cfg.Daemon != "off" {
-			err = daemon.InstallDaemon(cfg)
-		}
+	if cfg.Daemon == "install" || ncutils.IsFreeBSD() {
+		err = daemon.InstallDaemon()
 		if err != nil {
 			return err
-		} else {
-			daemon.Restart()
 		}
 	}
 
+	daemon.Restart()
 	return nil
 }
 
@@ -279,25 +225,4 @@ func formatName(node models.Node) string {
 		node.Name = ""
 	}
 	return node.Name
-}
-
-func setListenPort(oldListenPort int32, cfg *config.ClientConfig) {
-	// keep track of the returned listenport value
-	newListenPort := cfg.Node.ListenPort
-
-	if newListenPort != oldListenPort {
-		var errN error
-		// get free port based on returned default listen port
-		cfg.Node.ListenPort, errN = ncutils.GetFreePort(cfg.Node.ListenPort)
-		if errN != nil {
-			cfg.Node.ListenPort = newListenPort
-			logger.Log(1, "Error retrieving port: ", errN.Error())
-		}
-
-		// if newListenPort has been modified to find an available port, publish to server
-		if cfg.Node.ListenPort != newListenPort {
-			var currentCommsCfg = getCommsCfgByNode(&cfg.Node)
-			PublishNodeUpdate(&currentCommsCfg, cfg)
-		}
-	}
 }

@@ -3,6 +3,7 @@ package logic
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/netclient/local"
 	"github.com/gravitl/netmaker/netclient/ncutils"
 	"github.com/gravitl/netmaker/netclient/wireguard"
 	"golang.zx2c4.com/wireguard/wgctrl"
@@ -50,9 +52,9 @@ func HasPeerConnected(node *models.Node) bool {
 func IfaceDelta(currentNode *models.Node, newNode *models.Node) bool {
 	// single comparison statements
 	if newNode.Endpoint != currentNode.Endpoint ||
-		newNode.LocalAddress != currentNode.LocalAddress ||
 		newNode.PublicKey != currentNode.PublicKey ||
 		newNode.Address != currentNode.Address ||
+		newNode.Address6 != currentNode.Address6 ||
 		newNode.IsEgressGateway != currentNode.IsEgressGateway ||
 		newNode.IsIngressGateway != currentNode.IsIngressGateway ||
 		newNode.IsRelay != currentNode.IsRelay ||
@@ -67,12 +69,6 @@ func IfaceDelta(currentNode *models.Node, newNode *models.Node) bool {
 	}
 
 	// multi-comparison statements
-	if newNode.IsDualStack == "yes" {
-		if newNode.Address6 != currentNode.Address6 {
-			return true
-		}
-	}
-
 	if newNode.IsEgressGateway == "yes" {
 		if len(currentNode.EgressGatewayRanges) != len(newNode.EgressGatewayRanges) {
 			return true
@@ -118,9 +114,11 @@ func getSystemPeers(node *models.Node) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, peer := range device.Peers {
-		if IsBase64(peer.PublicKey.String()) && peer.Endpoint != nil && CheckEndpoint(peer.Endpoint.String()) {
-			peers[peer.PublicKey.String()] = peer.Endpoint.String()
+	if device.Peers != nil && len(device.Peers) > 0 {
+		for _, peer := range device.Peers {
+			if IsBase64(peer.PublicKey.String()) && peer.Endpoint != nil && CheckEndpoint(peer.Endpoint.String()) {
+				peers[peer.PublicKey.String()] = peer.Endpoint.String()
+			}
 		}
 	}
 	return peers, nil
@@ -156,9 +154,22 @@ func initWireguard(node *models.Node, privkey string, peers []wgtypes.PeerConfig
 			logger.Log(0, "failed to get network"+err.Error())
 			return err
 		}
-		net := strings.Split(network.AddressRange, "/")
-		mask := net[len(net)-1]
-		setKernelDevice(ifacename, node.Address, mask)
+		var address4 string
+		var address6 string
+		var mask4 string
+		var mask6 string
+		if network.AddressRange != "" {
+			net := strings.Split(network.AddressRange, "/")
+			mask4 = net[len(net)-1]
+			address4 = node.Address
+		}
+		if network.AddressRange6 != "" {
+			net := strings.Split(network.AddressRange6, "/")
+			mask6 = net[len(net)-1]
+			address6 = node.Address6
+		}
+
+		setKernelDevice(ifacename, address4, mask4, address6, mask6)
 	}
 
 	nodeport := int(node.ListenPort)
@@ -239,17 +250,25 @@ func initWireguard(node *models.Node, privkey string, peers []wgtypes.PeerConfig
 				_, _ = ncutils.RunCmd(ipExec+" -4 route add "+gateway+" dev "+ifacename, true)
 			}
 		}
-		if node.Address6 != "" && node.IsDualStack == "yes" {
-			logger.Log(1, "adding address:", node.Address6)
-			_, _ = ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+node.Address6+"/64", true)
+		if node.Address != "" {
+			logger.Log(1, "adding address:", node.Address)
+			_, _ = ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+node.Address+"/32", true)
+		}
+		if node.Address6 != "" {
+			logger.Log(1, "adding address6:", node.Address6)
+			_, _ = ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+node.Address6+"/128", true)
 		}
 		wireguard.SetPeers(ifacename, node, peers)
+	}
+
+	if node.IsServer == "yes" {
+		setServerRoutes(node.Interface, node.Network)
 	}
 
 	return err
 }
 
-func setKernelDevice(ifacename, address, mask string) error {
+func setKernelDevice(ifacename, address4, mask4, address6, mask6 string) error {
 	ipExec, err := exec.LookPath("ip")
 	if err != nil {
 		return err
@@ -258,7 +277,12 @@ func setKernelDevice(ifacename, address, mask string) error {
 	// == best effort ==
 	ncutils.RunCmd("ip link delete dev "+ifacename, false)
 	ncutils.RunCmd(ipExec+" link add dev "+ifacename+" type wireguard", true)
-	ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+address+"/"+mask, true) // this was a bug waiting to happen
+	if address4 != "" {
+		ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+address4+"/"+mask4, true)
+	}
+	if address6 != "" {
+		ncutils.RunCmd(ipExec+" address add dev "+ifacename+" "+address6+"/"+mask6, true)
+	}
 
 	return nil
 }
@@ -322,9 +346,6 @@ func setWGKeyConfig(node *models.Node) error {
 }
 
 func removeLocalServer(node *models.Node) error {
-	if !IsLocalServer(node) {
-		return nil
-	}
 
 	var err error
 	var ifacename = node.Interface
@@ -370,4 +391,22 @@ func removeLocalServer(node *models.Node) error {
 		_ = os.Remove(home + "nm-" + node.Network + ".conf")
 	}
 	return err
+}
+
+func setServerRoutes(iface, network string) {
+	parentNetwork, err := GetParentNetwork(network)
+	if err == nil {
+		if parentNetwork.AddressRange != "" {
+			ip, cidr, err := net.ParseCIDR(parentNetwork.AddressRange)
+			if err == nil {
+				local.SetCIDRRoute(iface, ip.String(), cidr)
+			}
+		}
+		if parentNetwork.AddressRange6 != "" {
+			ip, cidr, err := net.ParseCIDR(parentNetwork.AddressRange6)
+			if err == nil {
+				local.SetCIDRRoute(iface, ip.String(), cidr)
+			}
+		}
+	}
 }

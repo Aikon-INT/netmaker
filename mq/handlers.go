@@ -11,7 +11,7 @@ import (
 	"github.com/gravitl/netmaker/netclient/ncutils"
 )
 
-// DefaultHandler default message queue handler - only called when GetDebug == true
+// DefaultHandler default message queue handler  -- NOT USED
 func DefaultHandler(client mqtt.Client, msg mqtt.Message) {
 	logger.Log(0, "MQTT Message: Topic: ", string(msg.Topic()), " Message: ", string(msg.Payload()))
 }
@@ -36,17 +36,19 @@ func Ping(client mqtt.Client, msg mqtt.Message) {
 			logger.Log(0, record)
 			return
 		}
-		_, decryptErr := decryptMsg(&node, msg.Payload())
+		version, decryptErr := decryptMsg(&node, msg.Payload())
 		if decryptErr != nil {
 			logger.Log(0, "error decrypting when updating node ", node.ID, decryptErr.Error())
 			return
 		}
 		node.SetLastCheckIn()
+		node.Version = string(version)
 		if err := logic.UpdateNode(&node, &node); err != nil {
 			logger.Log(0, "error updating node", node.Name, node.ID, " on checkin", err.Error())
 			return
 		}
-		logger.Log(3, "ping processed for node", node.ID)
+
+		logger.Log(3, "ping processed for node", node.Name, node.ID)
 		// --TODO --set client version once feature is implemented.
 		//node.SetClientVersion(msg.Payload())
 	}()
@@ -79,6 +81,7 @@ func UpdateNode(client mqtt.Client, msg mqtt.Message) {
 			logger.Log(1, "error saving node", err.Error())
 			return
 		}
+		updateNodePeers(&currentNode)
 		logger.Log(1, "updated node", id, newNode.Name)
 	}()
 }
@@ -112,20 +115,25 @@ func ClientPeerUpdate(client mqtt.Client, msg mqtt.Message) {
 				return
 			}
 		case ncutils.DONE:
-			currentServerNode, err := logic.GetNetworkServerLocal(currentNode.Network)
-			if err != nil {
-				return
-			}
-			if err := logic.ServerUpdate(&currentServerNode, false); err != nil {
-				logger.Log(1, "server node:", currentServerNode.ID, "failed update")
-				return
-			}
-			if err := PublishPeerUpdate(&currentNode); err != nil {
-				logger.Log(1, "error publishing peer update ", err.Error())
-				return
-			}
+			updateNodePeers(&currentNode)
 		}
 
 		logger.Log(1, "sent peer updates after signal received from", id, currentNode.Name)
 	}()
+}
+
+func updateNodePeers(currentNode *models.Node) {
+	currentServerNode, err := logic.GetNetworkServerLocal(currentNode.Network)
+	if err != nil {
+		logger.Log(1, "failed to get server node failed update\n", err.Error())
+		return
+	}
+	if err := logic.ServerUpdate(&currentServerNode, false); err != nil {
+		logger.Log(1, "server node:", currentServerNode.ID, "failed update")
+		return
+	}
+	if err := PublishPeerUpdate(currentNode); err != nil {
+		logger.Log(1, "error publishing peer update ", err.Error())
+		return
+	}
 }
